@@ -1,0 +1,13 @@
+name: build
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions: { contents: read }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }  # Gradle 9.6.1 runs on JDK 17; foojay provisions the toolchain
+      - run: ./gradlew build --no-daemon

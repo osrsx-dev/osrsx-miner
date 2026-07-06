@@ -1,0 +1,11 @@
+apply plugin: 'io.osrsx.plugin'
+
+osrsxPlugin {
+    id = 'ping'
+    group = 'com.example'
+    version = '1.0.0'
+    name = 'Ping'
+    description = 'Logs "pong" when started — the sample plugin.'
+    authors = ['Your Name']
+    tags = ['utility']
+}

@@ -1,0 +1,17 @@
+buildscript {
+    repositories {
+        mavenLocal()   // locally-published (bumped) io.osrsx:osrsx-gradle wins over remote for local dev
+        maven { url = uri('https://raw.githubusercontent.com/osrsx/osrsx-maven/main/') }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'io.osrsx:osrsx-gradle:latest.release'
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+
+rootProject.name = 'osrsx-plugin-template'
