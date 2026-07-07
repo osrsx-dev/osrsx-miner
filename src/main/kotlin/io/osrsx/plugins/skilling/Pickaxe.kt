@@ -20,7 +20,7 @@ import io.osrsx.util.Rng
  *  - `> 0`   → busy acquiring/wielding it this loop — return this ms delay from `onLoop`;
  *  - `< 0`   → no usable pickaxe exists at all (never happens — bronze needs level 1) — stop.
  */
-class Pickaxe(private val ctx: PluginContext) {
+class Pickaxe(private val ctx: PluginContext, private val wantHammer: () -> Boolean = { false }) {
 
     /** One pickaxe tier: its GE item [id], the Mining level to MINE with it, and whether it's a cheap metal
      *  tier we're willing to buy off the GE when the player owns nothing. */
@@ -55,32 +55,38 @@ class Pickaxe(private val ctx: PluginContext) {
         val invIds = ctx.inventory().items().mapTo(HashSet()) { it.id }
         val equipIds = ctx.equipment().items().mapTo(HashSet()) { it.id }
 
-        // Already wearing a usable pickaxe → ready.
-        if (usable.any { it.id in equipIds }) { wieldTries = 0; return@section null }
-        // Carried but not worn → wield it (a few tries; a too-low Attack level can't, and it still mines from
-        // the inventory), then ready.
+        val wornPickaxe = usable.any { it.id in equipIds }
         val carried = usable.firstOrNull { it.id in invIds }
-        if (carried != null) {
-            if (wieldTries < MAX_WIELD_TRIES) { ctx.equipment().equip(carried.id); wieldTries++ }
+        val hasPickaxe = wornPickaxe || carried != null
+        // For Motherlode we always keep a HAMMER too (to fix a stopped water wheel without a bank trip).
+        val hasHammer = !wantHammer() || HAMMER in invIds || HAMMER in equipIds
+
+        if (hasPickaxe && hasHammer) {
+            // Geared. Wield a carried pickaxe (a few tries — too-low Attack can't, and it still mines from the
+            // inventory), else we're already set.
+            if (wornPickaxe) wieldTries = 0
+            else if (carried != null && wieldTries < MAX_WIELD_TRIES) { ctx.equipment().equip(carried.id); wieldTries++ }
             return@section null
         }
 
-        // Not held → reconcile via a loadout: prefer withdrawing an owned tier from the bank; when the player
-        // owns none anywhere, buy the best *cheap metal* tier the level allows (guaranteed affordable).
+        // Missing the pickaxe and/or hammer → reconcile via a loadout: withdraw an owned tier from the bank
+        // (buying the best cheap metal tier only if none owned), plus a hammer when we keep one.
         val buyTarget = usable.firstOrNull { it.buyable } ?: usable.last()
-        val loadout = ctx.loadouts().build("Miner pickaxe") {
+        val loadout = ctx.loadouts().build("Miner gear") {
             item(
                 ItemRef.AnyOf(usable.map { it.id }),
                 quantity = 1,
                 minimum = 1,
                 restock = RestockSpec(ItemRef.ById(buyTarget.id), 1, markupPercent = 10),
             )
+            if (wantHammer()) item(ItemRef.ById(HAMMER), quantity = 1, minimum = 1, restock = RestockSpec(ItemRef.ById(HAMMER), 1, 10))
         }
         if (ctx.loadouts().apply(loadout)) null else Rng.uniform(400, 800)
     }
 
     private companion object {
         const val MAX_WIELD_TRIES = 4
+        const val HAMMER = 2347 // ItemID.HAMMER — kept for Motherlode water-wheel repairs
 
         // Pickaxe GE item ids (net.runelite.api.gameval.ItemID).
         const val BRONZE = 1265

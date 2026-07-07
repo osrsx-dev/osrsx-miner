@@ -25,9 +25,6 @@ class MotherlodeRoutine(
     private val ctx: PluginContext,
     private val useUpper: () -> Boolean,
     private val repairWheel: () -> Boolean,
-    /** true = keep a hammer in the inventory (grabbed while banking); false = fetch one from the bank only
-     *  on-demand when the wheel is actually stopped. */
-    private val keepHammer: () -> Boolean,
     private val gearUp: () -> Long?,
     private val stats: MinerStats,
     lockInput: () -> Boolean,
@@ -61,17 +58,20 @@ class MotherlodeRoutine(
     private var payDirtAtDeposit = 0
     private var bankOpening = false
 
-    /** Consecutive hopper deposits that DIDN'T reduce our pay-dirt — i.e. the deposit was rejected because the
-     *  wheel is stopped and the machine has backed up. We only bother repairing after this hits 2 (assume the
-     *  deposit works and someone else fixes the wheel; only step in when it's clearly stuck). */
-    private var depositFails = 0
+    /** When our deposits first stopped going through (the wheel is stopped / machine backed up), or 0 when the
+     *  last deposit worked. If we can't deposit for [DEPOSIT_STUCK_MS], we fix the strut ourselves. */
+    private var depositStuckSince = 0L
 
     fun tick(): Long = loop.tick()
     fun releaseInput() = loop.releaseInput()
 
     private fun step(): Long {
-        stats.status = "gearing up"
-        gearUp()?.let { return it }
+        // Gearing is BLOCKED during a sack→bank drain: depositAll can bank a non-wielded pickaxe, and re-gearing
+        // it mid-drain would stall the collect cycle at the bank. We re-gear only once the sack is empty.
+        if (!draining) {
+            stats.status = "gearing up"
+            gearUp()?.let { return it }
+        }
 
         // ONE inventory snapshot per loop — scan it locally rather than a contains()/count() per item (each of
         // which was a separate client-thread hop; this is the bulk of the per-loop marshalling).
@@ -99,18 +99,20 @@ class MotherlodeRoutine(
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
 
-        // Wheel repair is a LAST resort, not proactive: on the busy upper level we assume our deposits go
-        // through and that another player fixes a broken strut. Only if our own deposits have failed twice
-        // (machine backed up), we're up top, there are ≥3 players around, and we happen to hold a hammer do we
-        // fix it ourselves. Never bothers on the lower floor / in a quiet world / without a hammer.
-        if (repairWheel() && haveHammer && !draining && onUpperFloor() && depositFails >= 2 &&
-            ctx.players().all().size >= MIN_PLAYERS_TO_REPAIR && brokenStruts() >= 2
+        // Wheel repair is a last resort: normally we assume deposits work and someone else fixes a broken
+        // strut. But if our own deposits have been stuck for over DEPOSIT_STUCK_MS (the wheel's clearly down),
+        // fix it ourselves — we always carry a hammer for exactly this.
+        if (repairWheel() && haveHammer && !draining && depositStuckSince != 0L &&
+            System.currentTimeMillis() - depositStuckSince > DEPOSIT_STUCK_MS && brokenStruts() >= 2
         ) return repair()
 
         return when {
             // The sack + bank are on the LOWER floor — climb down first if we mined up top.
             draining && onUpperFloor() -> descend()
-            draining && haveOre -> bankOre()   // bank each collected load...
+            draining && haveOre -> bankOre()   // bank each collected load first (frees inventory)
+            // Still holding pay-dirt with room in the sack → deposit it now so the inventory has slots to
+            // collect INTO (a full pay-dirt inventory can't receive any sack ore).
+            draining && payDirt > 0 && spaceLeft > 0 -> deposit()
             draining -> collect()              // ...and keep collecting until the sack is empty
             // We hold enough pay-dirt to top the sack off AND it still has room → deposit now (fills it, then
             // drains). A FULL sack (spaceLeft 0) is handled by the drain-enter above, not here — depositing
@@ -125,7 +127,9 @@ class MotherlodeRoutine(
     // ---- Steps ---------------------------------------------------------------------------------------
 
     private fun mine(): Long = ctx.profiler().section("miner/mlm-mine") {
-        if (loop.isAnimating()) { stats.status = "mining"; return@section snap(250, 900) }
+        // Debounced: a mining swing dips to idle briefly between hits, so only a SUSTAINED idle means the vein
+        // is done — otherwise we'd hop veins mid-mine.
+        if (loop.stillMining()) { stats.status = "mining"; return@section snap(250, 900) }
         closeStrayBank()?.let { return@section it }
 
         // Upper level preferred + accessible → climb the ladder up before mining (optional: falls back to the
@@ -172,11 +176,12 @@ class MotherlodeRoutine(
         val anchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
         val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
         val payDirt = ctx.inventory().count(PAY_DIRT)
-        // A click landed last loop; judge the outcome now: pay-dirt dropped ⇒ it went through (reset the fail
-        // count); unchanged ⇒ the deposit was rejected (machine backed up) ⇒ count a failure.
+        // A click landed last loop; judge the outcome now: pay-dirt dropped ⇒ it went through (clear the stuck
+        // clock); unchanged ⇒ the deposit was rejected (wheel down) ⇒ start/keep the stuck clock running.
         if (depositing) {
             depositing = false
-            if (payDirt < payDirtAtDeposit) depositFails = 0 else depositFails++
+            if (payDirt < payDirtAtDeposit) depositStuckSince = 0L
+            else if (depositStuckSince == 0L) depositStuckSince = System.currentTimeMillis()
             return@section snap(250, 700)
         }
         stats.status = "depositing"
@@ -205,13 +210,9 @@ class MotherlodeRoutine(
         bankOpening = false
         val before = countAll(MLM_ORES)
         if (before > 0) collectedAny = true
-        // Bank the cleaned ore. Normally the single "Deposit inventory" button (equipped pickaxe stays). But
-        // if we're draining a sack that filled while we still held pay-dirt, keep that pay-dirt (deposit it at
-        // the hopper once the sack is emptied) instead of banking it.
-        if (ctx.inventory().count(PAY_DIRT) > 0) banking.depositAllExcept(ItemRef.ByName(PAY_DIRT))
-        else banking.depositAll()
-        // Top up a hammer while we're here so repairs never need a dedicated trip.
-        if (repairWheel() && keepHammer() && !haveHammer()) ctx.bank().withdraw("Hammer", 1)
+        // Bank ONLY the cleaned ore + nuggets — keep the pickaxe, hammer and any held pay-dirt (so we never
+        // bank the tools and have to re-gear, and the hammer stays on us for wheel repairs).
+        banking.deposit(*ORE_REFS)
         banking.close()
         stats.addProduced((before - countAll(MLM_ORES)).coerceAtLeast(0))
         snap(400, 1000)
@@ -246,7 +247,8 @@ class MotherlodeRoutine(
     private fun repair(): Long = ctx.profiler().section("miner/mlm-repair") {
         closeStrayBank()?.let { return@section it }
         // Already fixed (maybe by another player) → the broken-strut object is gone, so there's nothing to do.
-        val strut = strut() ?: return@section snap(400, 900)
+        val strut = strut() ?: run { depositStuckSince = 0L; return@section snap(400, 900) }
+        depositStuckSince = 0L // we're acting on it — restart the stuck clock; deposits should resume after
         stats.status = "repairing wheel"
         // "Hammer" is the broken strut's DEFAULT action → left-click it. Using leftClickIfDefault (not the
         // right-click menu) means that if it just got fixed, this is a clean no-op instead of a ~10s
@@ -281,8 +283,9 @@ class MotherlodeRoutine(
     private fun strut(): SceneEntity? = ctx.objects().query().id(STRUT_BROKEN).nearest()
     /** How many wheel struts are broken (the wheel stops only when BOTH are). */
     private fun brokenStruts(): Int = ctx.objects().query().id(STRUT_BROKEN).count()
-    /** The ladder between floors (its action is just "Climb", up from the bottom / down from the top). */
-    private fun ladder(): SceneEntity? = ctx.objects().query().id(*LADDERS).withAction("Climb").nearest()
+    /** The ladder between floors (action "Climb", up from the bottom / down from the top). Matched by NAME +
+     *  the live "Climb" action so it works regardless of which ladder object id the floor uses. */
+    private fun ladder(): SceneEntity? = ctx.objects().query().named("Ladder").withAction("Climb").nearest()
 
     /** The nearest ore vein on OUR floor (see [nearestOnFloor]) — never one on the other floor stacked at the
      *  same world tile, which we couldn't reach. */
@@ -315,8 +318,6 @@ class MotherlodeRoutine(
 
     private fun sackCapacity(): Int = if (ctx.varps().varbit(BIGGER_SACK) == 1) SACK_LARGE else SACK_SMALL
 
-    private fun haveHammer(): Boolean = ctx.inventory().contains("Hammer") || ctx.inventory().contains("Imcando hammer")
-
     private fun countAll(names: List<String>): Int = names.sumOf { ctx.inventory().count(it) }
 
     private companion object {
@@ -337,7 +338,6 @@ class MotherlodeRoutine(
 
         // net.runelite.api.gameval.ObjectID
         val ORE_VEINS = intArrayOf(26661, 26662, 26663, 26664) // MOTHERLODE_ORE_SINGLE/LEFT/MIDDLE/RIGHT
-        val LADDERS = intArrayOf(19044, 19045)                  // MOTHERLODE_LADDER_BOTTOM/TOP
         const val STRUT_BROKEN = 26670                          // MOTHERLODE_WHEEL_STRUT_BROKEN ("Hammer" action)
         const val HOPPER = 26674                                // MOTHERLODE_HOPPER
         const val SACK = 26688                                  // MOTHERLODE_SACK (searchable)
@@ -351,7 +351,7 @@ class MotherlodeRoutine(
 
         const val INTERACT_RANGE = 15
         const val ARRIVE_RADIUS = 5 // "arrived" at the anchor when this close
-        const val MIN_PLAYERS_TO_REPAIR = 3 // only self-repair the wheel in a busy (≥3-player) upper level
+        const val DEPOSIT_STUCK_MS = 5000L // deposits blocked this long ⇒ the wheel's down, fix the strut
         const val INV_SLOTS = 28 // a full inventory (items() returns filled slots)
 
         const val PAY_DIRT = "Pay-dirt"
@@ -362,5 +362,8 @@ class MotherlodeRoutine(
 
         /** Everything the sack yields (ores + nuggets) — the "we have something to bank" set. */
         val MLM_ORE_SET = (MLM_ORES + NUGGET).toHashSet()
+
+        /** Refs to bank (ore + nuggets only) — deposited so the pickaxe, hammer and pay-dirt are kept. */
+        val ORE_REFS = (MLM_ORES + NUGGET).map { ItemRef.ByName(it) }.toTypedArray()
     }
 }

@@ -42,7 +42,9 @@ class NormalMiner(
     }
 
     private fun mine(): Long = ctx.profiler().section("miner/mine") {
-        if (loop.isAnimating()) { stats.status = "mining"; return@section snap(250, 900) }
+        // Debounced idle: a mining swing dips to idle between hits, so only a sustained idle means the rock's
+        // depleted (avoids re-clicking / hopping rocks mid-mine).
+        if (loop.stillMining()) { stats.status = "mining"; return@section snap(250, 900) }
 
         val target = site() ?: run { stats.status = "no location"; return@section snap(1200, 2500) }
 

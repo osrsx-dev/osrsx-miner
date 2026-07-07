@@ -52,6 +52,21 @@ class MinerLoop(
 
     fun isAnimating(): Boolean = (ctx.players().localPlayer()?.animation ?: IDLE) != IDLE
 
+    /**
+     * Whether we should still consider ourselves MINING (busy), with the idle animation DEBOUNCED: a mining
+     * animation dips to idle for a moment between swings, so a bare [isAnimating] == false would look like
+     * mining stopped and make the routine hop veins / re-click mid-mine. Returns true while animating, and for
+     * up to [debounceMs] after idle first appears — only a sustained idle (rock actually depleted / we're truly
+     * standing still) reads as not-mining.
+     */
+    fun stillMining(debounceMs: Long = IDLE_DEBOUNCE_MS): Boolean {
+        if (isAnimating()) { idleSinceMs = 0L; return true }
+        if (idleSinceMs == 0L) idleSinceMs = System.currentTimeMillis()
+        return System.currentTimeMillis() - idleSinceMs < debounceMs
+    }
+
+    private var idleSinceMs = 0L
+
     /** Can we stand next to [entity] and interact with it? */
     fun canReach(entity: SceneEntity): Boolean {
         val tile = entity.tile() ?: return false
@@ -60,6 +75,8 @@ class MinerLoop(
 
     private companion object {
         const val IDLE = -1
+        /** How long the idle animation must persist before we treat mining as actually stopped (~1 tick). */
+        const val IDLE_DEBOUNCE_MS = 600L
         const val IDLE_CHANCE = 0.03
         const val IDLE_MIN_MS = 1500L
         const val IDLE_MAX_MS = 4000L
