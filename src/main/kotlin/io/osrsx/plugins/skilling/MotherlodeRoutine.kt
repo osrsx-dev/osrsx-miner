@@ -49,6 +49,9 @@ class MotherlodeRoutine(
     /** After finishing a drain (at the bank), walk back to the vein cluster ONCE before mining again. */
     private var returnToAnchor = false
 
+    /** The vein tile we're currently working — kept until it depletes so we don't hop veins mid-mine. */
+    private var currentVein: Tile? = null
+
     /** Interaction latches — set when a click actually LANDS ([SceneEntity.leftClickIfDefault] returns true)
      *  and cleared by the deterministic world-state change that click causes (bank opens / sack count drops /
      *  held pay-dirt drops). So we never re-issue an action we've already triggered — no timers, no polling. */
@@ -148,13 +151,17 @@ class MotherlodeRoutine(
             else { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
         }
 
-        // Mine the nearest vein ON OUR FLOOR — never one on the other floor stacked at the same world tile.
-        val vein = floorVein()
+        // STICK with the vein we're already mining until it's depleted — MLM veins yield several pay-dirt
+        // before collapsing, so re-picking the nearest each loop (they're often equidistant) would hop off a
+        // still-productive vein and waste the walk. Only choose a fresh vein once the current one is gone.
+        val vein = currentVein?.let { veinAt(it) } ?: floorVein()
         if (vein != null && vein.distance() <= INTERACT_RANGE) {
+            currentVein = vein.tile()
             stats.status = "mining"
             leftOrMenu(vein, "Mine")
             return@section snap(400, 1800)
         }
+        currentVein = null
         stats.status = "walking"
         ctx.webWalking().walkTo(anchor)
         snap(300, 1200)
@@ -280,6 +287,14 @@ class MotherlodeRoutine(
     /** The nearest ore vein on OUR floor (see [nearestOnFloor]) — never one on the other floor stacked at the
      *  same world tile, which we couldn't reach. */
     private fun floorVein(): SceneEntity? = nearestOnFloor(ORE_VEINS)
+
+    /** The still-minable ore vein AT tile [t] on our floor, or null once it's depleted (no longer an "Ore vein"
+     *  with a Mine action there). Lets us keep working one vein until it collapses. */
+    private fun veinAt(t: Tile): SceneEntity? {
+        val me = ctx.players().localPlayer()?.tileHeight() ?: return null
+        return ctx.objects().query().id(*ORE_VEINS).withAction("Mine").within(t, 0).list()
+            .firstOrNull { (it.tileHeight() < UPPER_FLOOR_HEIGHT) == (me < UPPER_FLOOR_HEIGHT) }
+    }
 
     // ---- Floors (Motherlode overlays its two levels at the same tile+plane; only tile HEIGHT differs) -----
 
