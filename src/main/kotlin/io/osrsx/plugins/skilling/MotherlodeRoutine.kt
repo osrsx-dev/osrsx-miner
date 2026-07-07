@@ -79,6 +79,7 @@ class MotherlodeRoutine(
      *  re-clicking the ladder on arrival (which climbs straight back up, bouncing between floors). */
     private var climbing = false
     private var climbFromUpper = false
+    private var climbClickedAt = 0L
 
     /** Consecutive loops the anchor has looked unreachable — debounces the trapped-pocket check so a transient
      *  pathfinder miss doesn't send us mining a rockfall when we aren't actually walled in. */
@@ -381,7 +382,9 @@ class MotherlodeRoutine(
     private fun climb(status: String): Long {
         if (climbing) {
             if (onUpperFloor() != climbFromUpper) { climbing = false; return snap(300, 700) } // floor flipped — done
-            return snap(500, 1100)                                                            // mid-climb — wait
+            if (System.currentTimeMillis() - climbClickedAt < ACTION_RETRY_MS) return snap(500, 1100) // climbing — wait
+            climbing = false // floor never flipped → the Climb was missed/eaten (mid-mine, or the ladder was
+                             // occluded by the vein) — fall through and re-issue instead of latching forever.
         }
         val ladder = ladder()
         if (ladder == null || ladder.distance() > CLICK_RANGE) {
@@ -389,7 +392,9 @@ class MotherlodeRoutine(
         }
         stats.status = status
         climbFromUpper = onUpperFloor()
-        if (ladder.leftClickIfDefault("Climb")) climbing = true // we issued a Climb — hold until the floor flips
+        // PRECISE click: the ladder can sit behind a vein (whose "Mine" wins a plain hover), so a plain
+        // leftClickIfDefault silently fails; interactPrecise rotates it into view and locks its own clickbox.
+        if (ladder.interactPrecise("Climb")) { climbing = true; climbClickedAt = System.currentTimeMillis() }
         return snap(1500, 2800)
     }
 
