@@ -1,6 +1,7 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.BankingService
+import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.SceneEntity
 import io.osrsx.api.Tile
@@ -45,6 +46,9 @@ class MotherlodeRoutine(
     private var collectedAny = false
     private var emptyStreak = 0
 
+    /** After finishing a drain (at the bank), walk back to the vein cluster ONCE before mining again. */
+    private var returnToAnchor = false
+
     /** Interaction latches — set when a click actually LANDS ([SceneEntity.leftClickIfDefault] returns true)
      *  and cleared by the deterministic world-state change that click causes (bank opens / sack count drops /
      *  held pay-dirt drops). So we never re-issue an action we've already triggered — no timers, no polling. */
@@ -76,16 +80,18 @@ class MotherlodeRoutine(
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
         val spaceLeft = (capacity - sackNow).coerceAtLeast(0) // EXACT room left in the sack (live varbit)
 
-        // Enter drain the instant the sack is full: the varbit shows no space, OR we just deposited the load
-        // that tops it off (so we don't wait ~10s for the varbit to catch up).
-        if (!draining && payDirt == 0 && (spaceLeft == 0 || toppedOff)) {
+        // Enter drain the instant the sack is FULL — even if we're still holding pay-dirt. A full sack can't
+        // accept a deposit (the hopper rejects it), so we must empty it first; the held pay-dirt is kept aside
+        // (bankOre keeps it) and deposited afterwards. `toppedOff` also enters drain right after the load that
+        // fills it, so we don't wait ~10s for the varbit to catch up.
+        if (!draining && (spaceLeft == 0 || toppedOff)) {
             draining = true; toppedOff = false; collectedAny = false; emptyStreak = 0
         }
         // Exit once the sack is confirmed empty for a couple of loops AFTER we've actually collected (guards the
-        // wash-lag "0" right after topping off).
+        // wash-lag "0"). Doesn't require pay-dirt to be 0 — we may be holding a load to deposit after draining.
         if (draining) {
-            if (sackNow > 0) emptyStreak = 0 else if (collectedAny && !haveOre && payDirt == 0) emptyStreak++
-            if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0 }
+            if (sackNow > 0) emptyStreak = 0 else if (collectedAny && !haveOre) emptyStreak++
+            if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
 
         // Wheel stopped (BOTH struts broken) → the sack won't fill, so fix it. Repairing needs a hammer;
@@ -101,7 +107,9 @@ class MotherlodeRoutine(
         return when {
             draining && haveOre -> bankOre()   // bank each collected load...
             draining -> collect()              // ...and keep collecting until the sack is empty
-            // We hold enough pay-dirt to fill the sack → stop mining and deposit it now (tops the sack off).
+            // We hold enough pay-dirt to top the sack off AND it still has room → deposit now (fills it, then
+            // drains). A FULL sack (spaceLeft 0) is handled by the drain-enter above, not here — depositing
+            // into a full sack is rejected by the game.
             payDirt > 0 && spaceLeft in 1..payDirt -> { toppedOff = true; deposit() }
             // Otherwise deposit a full load whenever the inventory fills.
             full && payDirt > 0 -> deposit()
@@ -113,6 +121,7 @@ class MotherlodeRoutine(
 
     private fun mine(): Long = ctx.profiler().section("miner/mlm-mine") {
         if (loop.isAnimating()) { stats.status = "mining"; return@section snap(250, 900) }
+        closeStrayBank()?.let { return@section it }
 
         if (useUpper()) {
             climbUp()?.let {
@@ -122,21 +131,36 @@ class MotherlodeRoutine(
             }
         }
 
-        // Prefer the ore vein nearest the ANCHOR (the cluster), NOT the one nearest the player — otherwise
-        // after a bank trip it would mine sub-optimal veins by the bank instead of returning to the cluster.
-        val vein = anchorVein()
+        // Right after a bank trip, walk back to the ANCHOR cluster ONCE before resuming — so we don't mine
+        // sub-optimal veins next to the bank. This is a one-shot (not a per-loop distance gate, which would
+        // fight the small drift of walking onto each vein and stall).
+        val me = ctx.players().localPlayer()?.tile()
+        if (returnToAnchor) {
+            if (me != null && me.distanceTo(ANCHOR) <= ARRIVE_RADIUS) {
+                returnToAnchor = false
+            } else {
+                stats.status = "walking"
+                ctx.webWalking().walkTo(ANCHOR)
+                return@section snap(300, 1200)
+            }
+        }
+
+        // Mine the nearest vein BY LOCAL PATH — in front of us and reachable, so a vein across a wall (which
+        // sorts as unreachable) is never targeted, fixing the "clicks a vein through the wall" case.
+        val vein = ctx.objects().query().id(*ORE_VEINS).withAction("Mine").nearestByPath()
         if (vein != null && vein.distance() <= INTERACT_RANGE) {
             stats.status = "mining"
             leftOrMenu(vein, "Mine")
             return@section snap(400, 1800)
         }
-        // The cluster's veins are out of reach (we're away, e.g. just banked) → travel back to the anchor.
+        // Nothing minable in reach → head to the anchor cluster (the walker handles rockfalls / the route in).
         stats.status = "walking"
         ctx.webWalking().walkTo(ANCHOR)
         snap(300, 1200)
     }
 
     private fun deposit(): Long = ctx.profiler().section("miner/mlm-deposit") {
+        closeStrayBank()?.let { return@section it }
         val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(ANCHOR); return@section snap(300, 1200) }
         val payDirt = ctx.inventory().count(PAY_DIRT)
         // We already clicked Deposit and the pay-dirt hasn't left yet → the action is in flight, don't re-click.
@@ -149,6 +173,7 @@ class MotherlodeRoutine(
     }
 
     private fun collect(): Long = ctx.profiler().section("miner/mlm-collect") {
+        closeStrayBank()?.let { return@section it }
         val sack = sack() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(SACK_ANCHOR); return@section snap(300, 1200) }
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
         // We already clicked Search and the sack hasn't drained yet → the action is in flight, don't re-click.
@@ -167,8 +192,11 @@ class MotherlodeRoutine(
         bankOpening = false
         val before = countAll(MLM_ORES)
         if (before > 0) collectedAny = true
-        // Single "Deposit inventory" button — banks ore, nuggets and clutter; the equipped pickaxe stays.
-        banking.depositAll()
+        // Bank the cleaned ore. Normally the single "Deposit inventory" button (equipped pickaxe stays). But
+        // if we're draining a sack that filled while we still held pay-dirt, keep that pay-dirt (deposit it at
+        // the hopper once the sack is emptied) instead of banking it.
+        if (ctx.inventory().count(PAY_DIRT) > 0) banking.depositAllExcept(ItemRef.ByName(PAY_DIRT))
+        else banking.depositAll()
         // Top up a hammer while we're here so repairs never need a dedicated trip.
         if (repairWheel() && keepHammer() && !haveHammer()) ctx.bank().withdraw("Hammer", 1)
         banking.close()
@@ -202,10 +230,24 @@ class MotherlodeRoutine(
     }
 
     private fun repair(): Long = ctx.profiler().section("miner/mlm-repair") {
+        closeStrayBank()?.let { return@section it }
+        // Already fixed (maybe by another player) → the broken-strut object is gone, so there's nothing to do.
         val strut = strut() ?: return@section snap(400, 900)
         stats.status = "repairing wheel"
-        strut.interactAny(listOf("Hammer", "Fix", "Repair")) // confirmed action: "Hammer"
+        // "Hammer" is the broken strut's DEFAULT action → left-click it. Using leftClickIfDefault (not the
+        // right-click menu) means that if it just got fixed, this is a clean no-op instead of a ~10s
+        // right-click-retry loop hunting for a "Hammer" option that no longer exists.
+        strut.leftClickIfDefault("Hammer")
         snap(800, 2000)
+    }
+
+    /** If a bank window is still open, close it and wait — a leftover open bank (right after withdrawing a
+     *  hammer, or finishing gear-up) would otherwise make us click the strut/vein/hopper "through" the UI. */
+    private fun closeStrayBank(): Long? {
+        val banking = ctx.services().get<BankingService>() ?: return null
+        if (!banking.isOpen()) return null
+        banking.close()
+        return snap(300, 700)
     }
 
     /** Prefer a plain LEFT-click when [action] is the entity's live default (veins→Mine, hopper→Deposit,
@@ -216,12 +258,6 @@ class MotherlodeRoutine(
     }
 
     // ---- Scene queries -------------------------------------------------------------------------------
-
-    /** The ore vein nearest the ANCHOR (keeps mining in the cluster regardless of where we currently stand).
-     *  We do NOT gate on canReachToInteract — MLM veins sit flush in the rock face so that probe false-negatives. */
-    private fun anchorVein(): SceneEntity? =
-        ctx.objects().query().id(*ORE_VEINS).withAction("Mine").list()
-            .minByOrNull { it.tile()?.distanceTo(ANCHOR) ?: Int.MAX_VALUE }
 
     private fun hopper(): SceneEntity? = ctx.objects().query().id(HOPPER).nearest()
     private fun sack(): SceneEntity? = ctx.objects().query().id(SACK).nearest()
@@ -261,6 +297,7 @@ class MotherlodeRoutine(
         const val SACK_LARGE = 189
 
         const val INTERACT_RANGE = 15
+        const val ARRIVE_RADIUS = 5 // "arrived" at the anchor when this close
         const val MAX_HAMMER_TRIES = 4
         const val INV_SLOTS = 28 // a full inventory (items() returns filled slots)
 
