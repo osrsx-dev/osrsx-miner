@@ -8,6 +8,7 @@ import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.SceneEntity
 import io.osrsx.api.Tile
+import io.osrsx.api.facingTile
 import io.osrsx.api.get
 import io.osrsx.api.section
 import java.awt.Color
@@ -364,18 +365,22 @@ class MotherlodeRoutine(
         val sack = sack() ?: run { stats.status = "walking"; walkNear(SACK_ANCHOR); return@section snap(300, 1200) }
         mark(sack, Color.YELLOW, "Search")
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
-        // We already clicked Search and the sack hasn't drained yet → the action is in flight (walking to it +
-        // extracting), so wait — UNLESS it's been too long (the click missed / never reached the sack), in which
-        // case fall through and retry rather than waiting forever.
-        if (searching && sackNow >= sackAtSearch && System.currentTimeMillis() - searchClickedAt < ACTION_RETRY_MS) {
+        // We already clicked Search and the sack hasn't drained yet → the action is in flight. Keep waiting while
+        // we're still WALKING to it (a direct click from across the room walks-to-interact, which can outlast the
+        // retry timeout), and otherwise until ACTION_RETRY_MS — past which, stopped and undrained, the click
+        // missed, so fall through and retry rather than waiting forever.
+        val moving = ctx.players().localPlayer()?.isMoving ?: false
+        if (searching && sackNow >= sackAtSearch && (moving || System.currentTimeMillis() - searchClickedAt < ACTION_RETRY_MS)) {
             return@section snap(250, 700)
         }
         searching = false
-        approach(sack, SACK_ANCHOR)?.let { return@section it } // too far to click → close the gap first
-        sackAtSearch = sackNow
-        // Latch on the landed click; if it drains the sack we re-search next load, if it missed we retry after the timeout.
-        if (sack.leftClickIfDefault("Search")) { searching = true; searchClickedAt = System.currentTimeMillis() }
-        snap(500, 1300)
+        // DIRECT click first: if the sack is on-screen, one left-click makes the game walk-to-interact — no need
+        // to trudge to its anchor. Latch on the landed click; drained → re-search next load, missed → retry.
+        if (sack.leftClickIfDefault("Search")) {
+            searching = true; searchClickedAt = System.currentTimeMillis(); sackAtSearch = sackNow
+            return@section snap(500, 1300)
+        }
+        reveal(sack, SACK_ANCHOR) // couldn't land a direct click (culled/occluded) → close in + face it, retry next loop
     }
 
     private fun bankOre(): Long = ctx.profiler().section("miner/mlm-bank") {
@@ -407,17 +412,21 @@ class MotherlodeRoutine(
      *  the latch and re-click. ([bankOre] clears [bankOpening] the moment the bank is actually open.) */
     private fun openBank(banking: BankingService): Long {
         if (bankOpening) {
-            if (System.currentTimeMillis() - bankClickedAt < ACTION_RETRY_MS) return snap(300, 900) // opening — wait
+            // Keep waiting while we're still WALKING to the chest (a direct click across the room walks-to-interact,
+            // which can outlast the timeout); only once stopped-and-still-closed do we treat it as a missed click.
+            val moving = ctx.players().localPlayer()?.isMoving ?: false
+            if (moving || System.currentTimeMillis() - bankClickedAt < ACTION_RETRY_MS) return snap(300, 900) // opening — wait
             bankOpening = false // didn't open in time → the click missed; fall through and retry
         }
-        val chest = bankChest()
+        val chest = bankChest() ?: return if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
         mark(chest, Color(0x33, 0x99, 0xFF), "Bank")
-        if (chest != null) {
-            approach(chest, BANK_CHEST_TILE)?.let { return it }
-            if (chest.leftClickIfDefault("Use")) { bankOpening = true; bankClickedAt = System.currentTimeMillis() }
+        // DIRECT click first ("Use" is its default) — the game walks-to-interact when it's on-screen. Walk to its
+        // anchor only as a FALLBACK when the click can't land (culled/occluded).
+        if (chest.leftClickIfDefault("Use")) {
+            bankOpening = true; bankClickedAt = System.currentTimeMillis()
             return snap(400, 1000)
         }
-        return if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
+        return reveal(chest, BANK_CHEST_TILE)
     }
 
     /** Climb the ladder DOWN to the lower floor (the sack + bank live there) before draining/repairing. */
@@ -487,6 +496,15 @@ class MotherlodeRoutine(
         return snap(300, 900)
     }
 
+    /** FALLBACK for a fixed object we couldn't left-click directly (culled / off-screen / occluded): if it's still
+     *  far, step toward its [anchor] to bring it into the scene; if we're already beside it, rotate it into view.
+     *  Either way we retry the direct click next loop — so the common case (on-screen) never walks needlessly. */
+    private fun reveal(obj: SceneEntity, anchor: Tile): Long {
+        stats.status = "walking"
+        if (obj.distance() > CLICK_RANGE) walkNear(anchor) else ctx.camera().rotateToObject(obj)
+        return snap(300, 900)
+    }
+
     /** Walk (LOCALLY) toward [tile], first resolving to the nearest WALKABLE tile — the fixed MLM objects
      *  (sack/hopper/bank/ladder) sit on UNwalkable tiles, and a local step to an unwalkable dest just fails
      *  (that stalled the whole drain). [reachableNear] returns the closest reachable tile to the target. */
@@ -518,16 +536,20 @@ class MotherlodeRoutine(
             }
     }
 
-    /** The minable ore vein we're ACTUALLY working: the one orthogonally adjacent to the player (a mining
-     *  position), on our floor. You can only mine a vein you're standing next to, so this is the ground truth
-     *  for confirming which vein we're on when a click may have landed on a neighbour. Null if none adjacent. */
+    /** The minable ore vein we're ACTUALLY working, resolved by which tile we're FACING. The client turns us to
+     *  face the vein we mine, so [Player.facingTile] pinpoints it even when veins sit on BOTH sides of us (both
+     *  orthogonally adjacent — the old nearest-adjacent guess could highlight the wrong one). Falls back to any
+     *  orthogonally-adjacent minable vein when the faced tile has none (e.g. mid-turn). Null if none adjacent. */
     private fun workedVein(): SceneEntity? {
-        val me = ctx.players().localPlayer()?.tile() ?: return null
-        return ctx.objects().query().id(*ORE_VEINS).withAction("Mine").within(1).sortNearest().list()
-            .firstOrNull { v ->
-                val t = v.tile() ?: return@firstOrNull false
+        val player = ctx.players().localPlayer() ?: return null
+        val me = player.tile() ?: return null
+        val faced = player.facingTile()
+        val adjacent = ctx.objects().query().id(*ORE_VEINS).withAction("Mine").within(1).sortNearest().list()
+            .filter { v ->
+                val t = v.tile() ?: return@filter false
                 kotlin.math.abs(t.x - me.x) + kotlin.math.abs(t.y - me.y) == 1 && sameFloor(v.tileHeight())
             }
+        return adjacent.firstOrNull { it.tile() == faced } ?: adjacent.firstOrNull()
     }
 
     /** The still-minable ore vein AT tile [t] on our floor, or null once it's depleted (no longer an "Ore vein"
