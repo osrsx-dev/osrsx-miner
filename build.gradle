@@ -3,7 +3,7 @@ apply plugin: 'io.osrsx.plugin'
 osrsxPlugin {
     id = 'miner'
     group = 'io.osrsx.plugins'
-    version = '2.0.0'
+    version = '2.0.1'
     name = 'Miner'
     description = 'Mines a chosen ore at a chosen location, with the right requirements per site.'
     authors = ['osrsx']

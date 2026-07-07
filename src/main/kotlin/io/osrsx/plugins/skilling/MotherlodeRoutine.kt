@@ -90,6 +90,11 @@ class MotherlodeRoutine(
      *  pathfinder miss doesn't send us mining a rockfall when we aren't actually walled in. */
     private var trappedStreak = 0
 
+    /** Consecutive mining-phase loops we've been fully idle (not animating AND not walking). If a target vein
+     *  is mined out by another player while we approach it, we can end up committed to a dead tile and just
+     *  stand there — this counter forces a re-pick once we've clearly stalled. */
+    private var idleStreak = 0
+
     /** The single live target highlight — re-pointed as the current object changes (so highlights don't stack);
      *  null when nothing is marked. Auto-cleared when the plugin stops. */
     private var targetHl: Highlight? = null
@@ -215,6 +220,14 @@ class MotherlodeRoutine(
 
     private fun mine(): Long = ctx.profiler().section("miner/mlm-mine") {
         closeStrayBank()?.let { return@section it }
+
+        // Stall recovery: if we're fully idle (not mining AND not walking) for several loops, our target vein
+        // was likely mined out by someone else mid-approach (or the click never took), leaving us committed to a
+        // dead tile and standing still. Drop it so the pick below re-selects a fresh, live vein. Walking or
+        // animating resets the streak, so normal mining/travel never trips this.
+        val moving = ctx.players().localPlayer()?.isMoving ?: false
+        idleStreak = if (!loop.isAnimating() && !moving) idleStreak + 1 else 0
+        if (idleStreak >= STUCK_LOOPS) { idleStreak = 0; currentVein = null; clearMark() }
 
         // Stay on the CURRENT vein until its object is GONE (depleted) — MLM veins yield several pay-dirt before
         // collapsing, so we switch on the object disappearing, NOT on the idle animation (which dips between
@@ -593,6 +606,7 @@ class MotherlodeRoutine(
         // normal between-swing dip and must NOT re-click, or we spam the same vein.
         const val VEIN_IDLE_DEBOUNCE_MS = 1800L
         const val TRAP_CONFIRM = 2 // consecutive "anchor unreachable" reads before we treat ourselves as boxed in
+        const val STUCK_LOOPS = 4  // consecutive fully-idle mining loops before we drop the vein and re-pick
         const val DEPOSIT_STUCK_MS = 5000L // no wash for this long (both struts broken) ⇒ the wheel's down, fix it
         const val WASH_STALE_MS = 9000L    // no wash this long + wheel NOT down ⇒ pending estimate is stale, clear it
         const val SACK_RESERVE = 1 // treat the sack full 1 early so a whole deposited load always fits
