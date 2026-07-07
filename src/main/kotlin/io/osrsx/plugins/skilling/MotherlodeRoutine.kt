@@ -101,10 +101,11 @@ class MotherlodeRoutine(
 
         // Wheel repair is a last resort: normally we assume deposits work and someone else fixes a broken
         // strut. But if our own deposits have been stuck for over DEPOSIT_STUCK_MS (the wheel's clearly down),
-        // fix it ourselves — we always carry a hammer for exactly this.
+        // fix it ourselves — we always carry a hammer for exactly this. The struts are on the LOWER floor, so
+        // climb down to them first if we mined up top (clicking from above does nothing).
         if (repairWheel() && haveHammer && !draining && depositStuckSince != 0L &&
             System.currentTimeMillis() - depositStuckSince > DEPOSIT_STUCK_MS && brokenStruts() >= 2
-        ) return repair()
+        ) return if (onUpperFloor()) descend() else repair()
 
         return when {
             // The sack + bank are on the LOWER floor — climb down first if we mined up top.
