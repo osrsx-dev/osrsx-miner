@@ -55,6 +55,9 @@ class MinerPlugin : Plugin(), HasOverlay {
         var wearProspector by boolItem("wearProspector", "Wear prospector outfit", true,
             "Equip the Prospector outfit (Mining XP boost) from your bank if you own it", section = "Setup")
 
+        var highlightObjects by boolItem("highlightObjects", "Highlight targets", true,
+            "Outline the object the bot is currently acting on (vein, hopper, sack, bank, ladder)", section = "Setup")
+
         var mlmUpper by boolItem("mlmUpper", "Use upper level", false,
             "Motherlode: mine the upper level (57 Mining) — climbs the ladder up first",
             section = "Setup", visibleIf = eq("ore", MLM))
@@ -129,6 +132,7 @@ class MinerPlugin : Plugin(), HasOverlay {
             repairWheel = { Config.mlmRepair },
             gearUp = { gearUp() },
             dropGems = { Config.dropGems },
+            highlight = { Config.highlightObjects },
             stats = stats,
             lockInput = { Config.lockInput },
             stopReason = { stops.reason() },

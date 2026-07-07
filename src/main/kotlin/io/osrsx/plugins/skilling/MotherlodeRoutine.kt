@@ -1,12 +1,16 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.BankingService
+import io.osrsx.api.HIGHLIGHT_FOREVER
+import io.osrsx.api.Highlight
+import io.osrsx.api.HighlightStyle
 import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.SceneEntity
 import io.osrsx.api.Tile
 import io.osrsx.api.get
 import io.osrsx.api.section
+import java.awt.Color
 
 /**
  * The Motherlode Mine routine — the full pay-dirt cycle the ordinary rock loop can't model:
@@ -27,6 +31,7 @@ class MotherlodeRoutine(
     private val repairWheel: () -> Boolean,
     private val gearUp: () -> Long?,
     private val dropGems: () -> Boolean,
+    private val highlight: () -> Boolean,
     private val stats: MinerStats,
     lockInput: () -> Boolean,
     stopReason: () -> String?,
@@ -85,8 +90,26 @@ class MotherlodeRoutine(
      *  pathfinder miss doesn't send us mining a rockfall when we aren't actually walled in. */
     private var trappedStreak = 0
 
+    /** The single live target highlight — re-pointed as the current object changes (so highlights don't stack);
+     *  null when nothing is marked. Auto-cleared when the plugin stops. */
+    private var targetHl: Highlight? = null
+    private var targetHlKey: String? = null
+
     fun tick(): Long = loop.tick()
-    fun releaseInput() = loop.releaseInput()
+    fun releaseInput() { loop.releaseInput(); clearMark() }
+
+    /** Outline [entity] as the CURRENT target, colour-coded per action, reusing one handle so highlights never
+     *  stack. Passing null (or with the option off) clears it. The highlight tracks the entity as it moves. */
+    private fun mark(entity: SceneEntity?, color: Color, label: String) {
+        if (!highlight() || entity == null) { clearMark(); return }
+        val key = "${entity.tile()}|$label"
+        if (key == targetHlKey && targetHl?.active == true) return // already marking this exact target
+        targetHl?.remove()
+        targetHl = ctx.highlights().highlight(entity, HighlightStyle(color = color, label = label), HIGHLIGHT_FOREVER)
+        targetHlKey = key
+    }
+
+    private fun clearMark() { targetHl?.remove(); targetHl = null; targetHlKey = null }
 
     private fun step(): Long {
         // Gearing is BLOCKED during a sack→bank drain: depositAll can bank a non-wielded pickaxe, and re-gearing
@@ -240,6 +263,7 @@ class MotherlodeRoutine(
     }
 
     private fun mineVein(vein: SceneEntity): Long {
+        mark(vein, Color.GREEN, "Mine")
         stats.status = "mining"
         if (loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) return snap(400, 1000) // already mining — don't re-issue
 
@@ -272,6 +296,7 @@ class MotherlodeRoutine(
                 (r.tileHeight() < UPPER_FLOOR_HEIGHT) == onUpperFloor() && ctx.walking().canReachToInteract(t)
             }
         if (fall != null) {
+            mark(fall, Color.RED, "Clear rockfall")
             if (!loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) leftOrMenu(fall, "Mine")
             return@section snap(400, 1000)
         }
@@ -288,6 +313,7 @@ class MotherlodeRoutine(
         // tiles away (just beyond INTERACT_RANGE) and left us oscillating with a full inventory, never arriving.
         val hopperTile = if (onUpperFloor()) UPPER_HOPPER_TILE else HOPPER_TILE
         val hopper = hopper() ?: run { stats.status = "walking"; walkNear(hopperTile); return@section snap(300, 1200) }
+        mark(hopper, Color.ORANGE, "Deposit")
         val payDirt = ctx.inventory().count(PAY_DIRT)
         // A click landed last loop; judge the outcome now. Pay-dirt dropped ⇒ it went INTO the hopper: count it
         // as pending wash and (re)start the wheel-down clock from now, so we give the wheel DEPOSIT_STUCK_MS to
@@ -316,6 +342,7 @@ class MotherlodeRoutine(
         stats.status = "collecting" // set up-front so the in-flight early-return below doesn't leave a stale status
         closeStrayBank()?.let { return@section it }
         val sack = sack() ?: run { stats.status = "walking"; walkNear(SACK_ANCHOR); return@section snap(300, 1200) }
+        mark(sack, Color.YELLOW, "Search")
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
         // We already clicked Search and the sack hasn't drained yet → the action is in flight (walking to it +
         // extracting), so wait — UNLESS it's been too long (the click missed / never reached the sack), in which
@@ -364,6 +391,7 @@ class MotherlodeRoutine(
             bankOpening = false // didn't open in time → the click missed; fall through and retry
         }
         val chest = bankChest()
+        mark(chest, Color(0x33, 0x99, 0xFF), "Bank")
         if (chest != null) {
             approach(chest, BANK_CHEST_TILE)?.let { return it }
             if (chest.leftClickIfDefault("Use")) { bankOpening = true; bankClickedAt = System.currentTimeMillis() }
@@ -391,6 +419,7 @@ class MotherlodeRoutine(
             stats.status = "walking"; walkNear(LADDER_TILE); return snap(300, 1200)
         }
         stats.status = status
+        mark(ladder, Color.CYAN, status)
         climbFromUpper = onUpperFloor()
         // PRECISE click: the ladder can sit behind a vein (whose "Mine" wins a plain hover), so a plain
         // leftClickIfDefault silently fails; interactPrecise rotates it into view and locks its own clickbox.
@@ -402,6 +431,7 @@ class MotherlodeRoutine(
         closeStrayBank()?.let { return@section it }
         // Already fixed (maybe by another player) → the broken-strut object is gone, so there's nothing to do.
         val strut = strut() ?: run { lastWashMs = System.currentTimeMillis(); return@section snap(400, 900) }
+        mark(strut, Color.RED, "Repair")
         strut.tile()?.let { approach(strut, it)?.let { w -> return@section w } }
         lastWashMs = System.currentTimeMillis() // we're acting on it — give the wheel time to wash before re-judging
         stats.status = "repairing wheel"
