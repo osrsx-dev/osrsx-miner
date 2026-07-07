@@ -1,7 +1,6 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.BankingService
-import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.SceneEntity
 import io.osrsx.api.Tile
@@ -46,23 +45,34 @@ class MotherlodeRoutine(
         val payDirt = ctx.inventory().count(PAY_DIRT)
         val haveOre = MLM_ORES.any { ctx.inventory().contains(it) } || ctx.inventory().contains(NUGGET)
 
+        // Once the sack is (nearly) full, DRAIN it completely — keep collecting + banking until the sack
+        // varbit reads empty — rather than emptying a single inventory-load and going back to mining.
+        val sackSize = ctx.varps().varbit(SACK_TRANSMIT)
+        if (sackSize == 0) draining = false else if (sackNearFull()) draining = true
+
         return when {
             // Cleaned ore from a sack collect is waiting → bank it.
             haveOre -> bankOre()
+            // Draining: clear any leftover pay-dirt into the hopper first, then empty the sack load by load.
+            draining && payDirt > 0 -> deposit()
+            draining -> collect()
             // Inventory full of pay-dirt → feed the hopper.
             ctx.inventory().isFull() && payDirt > 0 -> deposit()
-            // Sack has filled up → collect it (only when not still holding pay-dirt to deposit first).
-            payDirt == 0 && sackNearFull() -> collect()
             // Otherwise mine (climbing up first if the upper level is requested).
             else -> mine()
         }
     }
 
+    /** True while we're emptying a full sack — set when it fills, cleared only when it reads empty. */
+    private var draining = false
+
     // ---- Steps ---------------------------------------------------------------------------------------
 
     private fun mine(): Long = ctx.profiler().section("miner/mlm-mine") {
-        // Reach the mine first if no MLM object is loaded around us.
-        if (!inMotherlode()) {
+        // Navigate to the central vein anchor FIRST — the web-walker handles the rockfall obstacles and the
+        // route into the mine on its own; we only start looking for veins once we've arrived there.
+        val me = ctx.players().localPlayer()?.tile()
+        if (me == null || me.distanceTo(ANCHOR) > ARRIVE_RADIUS) {
             stats.status = "walking"
             ctx.webWalking().walkTo(ANCHOR)
             return@section Rng.uniform(800, 1400)
@@ -78,19 +88,16 @@ class MotherlodeRoutine(
             }
         }
 
+        // At the anchor: mine the nearest ore vein. We deliberately do NOT gate on canReachToInteract — MLM
+        // veins sit flush in the rock face so the reachability probe false-negatives on them; interact() walks
+        // the last tile itself.
         val vein = vein()
-        if (vein != null && vein.distance() <= INTERACT_RANGE && loop.canReach(vein)) {
+        if (vein != null && vein.distance() <= INTERACT_RANGE) {
             stats.status = "mining"
             vein.interact("Mine")
             return@section Rng.uniform(1500, 2500)
         }
-        // No reachable vein — clear a rockfall blocking the way if one is adjacent, else wait for respawns.
-        rockfall()?.takeIf { it.distance() <= INTERACT_RANGE && loop.canReach(it) }?.let {
-            stats.status = "clearing rockfall"
-            it.interact("Mine")
-            return@section Rng.uniform(1200, 2000)
-        }
-        stats.status = "waiting"
+        stats.status = "waiting" // veins respawning
         Rng.uniform(1200, 2400)
     }
 
@@ -114,9 +121,11 @@ class MotherlodeRoutine(
         if (!banking.isOpen()) {
             return@section if (banking.openNearest()) Rng.uniform(500, 900) else Rng.uniform(1000, 1600)
         }
-        val ores = (MLM_ORES + NUGGET).map { ItemRef.ByName(it) }.toTypedArray()
         val before = countAll(MLM_ORES)
-        banking.deposit(*ores)
+        // The single "Deposit inventory" button — banks the cleaned ore, nuggets and any clutter in one click.
+        // The equipped pickaxe (weapon slot) is untouched; a pickaxe left in the inventory is re-withdrawn on
+        // the next loop by gearUp().
+        banking.depositAll()
         banking.close()
         stats.addProduced((before - countAll(MLM_ORES)).coerceAtLeast(0))
         Rng.uniform(600, 1000)
@@ -131,17 +140,15 @@ class MotherlodeRoutine(
 
     // ---- Scene queries -------------------------------------------------------------------------------
 
+    /** The closest ore vein by LOCAL-PATHFINDER distance (not Chebyshev) — inherently reachable, so it never
+     *  targets a vein walled off behind a rockfall (the cause of the "mines 14 then stalls" hang). */
     private fun vein(): SceneEntity? =
-        ctx.objects().query().id(*ORE_VEINS).withAction("Mine").nearest()
+        ctx.objects().query().id(*ORE_VEINS).withAction("Mine").nearestByPath()
 
     private fun hopper(): SceneEntity? = ctx.objects().query().id(HOPPER).nearest()
     private fun sack(): SceneEntity? = ctx.objects().query().id(SACK).nearest()
     private fun strut(): SceneEntity? = ctx.objects().query().id(STRUT_BROKEN).nearest()
-    private fun rockfall(): SceneEntity? = ctx.objects().query().id(*ROCKFALLS).withAction("Mine").nearest()
     private fun climbUp(): SceneEntity? = ctx.objects().query().withAction("Climb-up").nearest()
-
-    /** Any MLM object loaded nearby means we're in the mine (used to decide whether to travel there). */
-    private fun inMotherlode(): Boolean = vein() != null || hopper() != null || sack() != null || strut() != null
 
     // ---- Sack fill (read from the game varbit) -------------------------------------------------------
 
@@ -157,12 +164,15 @@ class MotherlodeRoutine(
     private fun countAll(names: List<String>): Int = names.sumOf { ctx.inventory().count(it) }
 
     private companion object {
-        /** The MLM hopper (DB tile) — where we web-walk to reach the mine when nothing MLM is in scene. */
-        val ANCHOR = Tile(3748, 5672, 0)
+        /** The central lower-level vein tile the web-walker routes to (it handles the rockfall obstacles and
+         *  the route into the mine itself). Only once we're here do we start looking for veins. */
+        val ANCHOR = Tile(3731, 5668, 0)
+
+        /** How close to [ANCHOR] counts as "arrived and ready to mine". */
+        const val ARRIVE_RADIUS = 5
 
         // net.runelite.api.gameval.ObjectID
         val ORE_VEINS = intArrayOf(26661, 26662, 26663, 26664) // MOTHERLODE_ORE_SINGLE/LEFT/MIDDLE/RIGHT
-        val ROCKFALLS = intArrayOf(26679, 26680)               // MOTHERLODE_ROCKFALL_1/2
         const val STRUT_BROKEN = 26670                          // MOTHERLODE_WHEEL_STRUT_BROKEN
         const val HOPPER = 26674                                // MOTHERLODE_HOPPER
         const val SACK = 26688                                  // MOTHERLODE_SACK (searchable)
