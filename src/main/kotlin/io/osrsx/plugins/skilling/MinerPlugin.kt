@@ -1,48 +1,75 @@
 package io.osrsx.plugins.skilling
 
-import io.osrsx.api.ItemRef
-import io.osrsx.api.Skill
+import io.osrsx.api.profile
 import io.osrsx.config.PluginConfig
+import io.osrsx.config.and
+import io.osrsx.config.eq
 import io.osrsx.config.isFalse
-import io.osrsx.config.isTrue
+import io.osrsx.config.notEq
 import io.osrsx.plugin.HasOverlay
 import io.osrsx.plugin.Plugin
 import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.ScriptGui
 
 /**
- * Sample mining plugin: mine a configured rock, then drop or bank the ore when full. Mirrors
- * [WoodcutterPlugin] — the differences are the object name ("… rocks"), the "Mine" action and the ore.
- * Gears up with the best pickaxe ([ToolManager]), web-walks to the nearest rock cluster when none is in
- * scene, honours stop targets and shows a stats overlay.
+ * Location-aware mining plugin. Pick an **ore** (Copper/Tin/Iron/Coal/Motherlode) and a **location**; the
+ * location dropdown lists only the catalogued sites your account qualifies for (see [MineSites]) — sites you
+ * can't use (members, combat, Mining level) are hidden — plus an "Auto — select best" entry that picks the
+ * eligible site nearest the bank (when banking) or nearest you (when dropping).
  *
- * Rocks stay MANUAL (no "Auto"): an ore rock is often the generically-named "Rocks" object whose ore
- * depends on its id, so a level→ore table can't reliably name the scene object. A generic "Rocks" fallback
- * covers the case where the live object reports that instead of e.g. "Iron rocks".
+ * Selecting **Motherlode** hides the location and bank options (its banking is mandatory) and switches to the
+ * dedicated [MotherlodeRoutine]; every other ore runs the catalogue-driven [NormalMiner]. Gears the best
+ * pickaxe via the Loadout API ([Pickaxe]) and shows a live stats overlay. Every loop is profiled under
+ * `miner/…` spans (zero-overhead when profiling is off).
  */
 @PluginDescriptor(
     name = "Miner",
-    description = "Mines a configured rock and drops or banks the ore.",
+    description = "Mines a chosen ore at a chosen location, with the right requirements per site.",
     author = "osrsx",
     tags = ["skilling", "mining", "gathering"],
 )
 class MinerPlugin : Plugin(), HasOverlay {
 
     object Config : PluginConfig("miner") {
-        var rock by objectItem("rock", "Rock name", "Rocks", "Object to mine",
-            filter = listOf("rocks", "rock", "ore vein"), browse = true, distinct = true)
-        var ore by itemItem("ore", "Ore name", "Copper ore", "Item name of the ore produced")
-        var bank by boolItem("bank", "Bank ore", false, "Bank the ore when full (else drop it)")
-        var getBestPickaxe by boolItem("getBestPickaxe", "Get best pickaxe", true,
-            "Before mining, equip the best pickaxe your level allows — from the bank, or bought if you own none",
-            section = "Setup")
-        var walk by boolItem("walk", "Walk to rocks", true,
-            "When no rock is nearby, web-walk to the nearest catalogued cluster", section = "Setup")
-        var home by stringItem("home", "Rock tile", "", "Optional 'x,y[,plane]' to walk back to after banking",
-            visibleIf = isTrue("bank"))
+        private const val MLM = "Motherlode"
 
-        var minDrop by intItem("minDrop", "Min drop (ms)", 90, 20, 2000, "Fastest per-item pause when power-dropping", "Ore", visibleIf = isFalse("bank"))
-        var maxDrop by intItem("maxDrop", "Max drop (ms)", 230, 20, 3000, "Slowest per-item pause when power-dropping", "Ore", visibleIf = isFalse("bank"))
+        var ore by enumItem("ore", "Ore", Ore.COPPER.display, Ore.displays, "What to mine")
+
+        var location by enumItem(
+            "location", "Location",
+            default = MineSites.BEST,
+            description = "Where to mine — only sites your account qualifies for are shown",
+            visibleIf = notEq("ore", MLM),
+        ) { ctx -> MineSites.optionsFor(Ore.fromDisplay(ore), ctx) }
+
+        var bank by boolItem("bank", "Bank ore", false, "Bank the ore when full (else power-drop it)",
+            visibleIf = notEq("ore", MLM))
+
+        var getBestPickaxe by boolItem("getBestPickaxe", "Get best pickaxe", true,
+            "Before mining, wield the best pickaxe your level allows — withdrawn from the bank, or bought if you own none",
+            section = "Setup")
+
+        var dropGems by boolItem("dropGems", "Drop gems", true,
+            "Power-drop any uncut gems as they're mined instead of keeping them", section = "Setup")
+
+        var wearProspector by boolItem("wearProspector", "Wear prospector outfit", true,
+            "Equip the Prospector outfit (Mining XP boost) from your bank if you own it", section = "Setup")
+
+        var highlightObjects by boolItem("highlightObjects", "Highlight targets", true,
+            "Outline the object the bot is currently acting on (vein, hopper, sack, bank, ladder)", section = "Setup")
+
+        var mlmUpper by boolItem("mlmUpper", "Use upper level", false,
+            "Motherlode: mine the upper level (57 Mining) — climbs the ladder up first",
+            section = "Setup", visibleIf = eq("ore", MLM))
+
+        var mlmRepair by boolItem("mlmRepair", "Repair water wheel", true,
+            "Motherlode: carry a hammer and fix the water wheel yourself if deposits stay blocked for 5s (a stopped wheel)",
+            section = "Setup", visibleIf = eq("ore", MLM))
+
+        var minDrop by intItem("minDrop", "Min drop (ms)", 90, 20, 2000, "Fastest per-item pause when power-dropping",
+            "Ore", visibleIf = isFalse("bank") and notEq("ore", MLM))
+        var maxDrop by intItem("maxDrop", "Max drop (ms)", 230, 20, 3000, "Slowest per-item pause when power-dropping",
+            "Ore", visibleIf = isFalse("bank") and notEq("ore", MLM))
 
         var lockInput by boolItem("lockInput", "Lock user input", false,
             "While running, ignore physical mouse/keyboard input so it can't disrupt the bot", section = "Antiban")
@@ -51,70 +78,101 @@ class MinerPlugin : Plugin(), HasOverlay {
         var stopAtOre by intItem("stopAtOre", "Stop at ore", 0, 0, 1_000_000, "Stop after this much ore (0 = never)", "Stopping")
         var stopAtGp by intItem("stopAtGp", "Stop at GP", 0, 0, 2_000_000_000, "Stop once the ore is worth this many GP (0 = never)", "Stopping")
         var stopAfterMins by intItem("stopAfterMins", "Stop after (min)", 0, 0, 100_000, "Stop after this many minutes (0 = never)", "Stopping")
+
+        val isMotherlode: Boolean get() = ore == MLM
     }
 
     override fun config() = Config
 
-    private val stats by lazy { SkillStats(ctx, Skill.MINING) }
-    private val pickaxe by lazy { ToolManager(ctx, Skill.MINING, keepExtra = { setOf(Config.ore) }) }
+    private val stats by lazy { MinerStats(ctx) }
+    // For Motherlode with repair on, gearing also keeps a hammer (to fix the water wheel without a bank trip).
+    private val pickaxe by lazy {
+        Pickaxe(
+            ctx,
+            wantHammer = { Config.isMotherlode && Config.mlmRepair },
+            wearProspector = { Config.wearProspector },
+        )
+    }
     private val stops by lazy {
         StopTargets(stats,
             level = { Config.stopAtLevel }, count = { Config.stopAtOre },
             gp = { Config.stopAtGp }, minutes = { Config.stopAfterMins },
-            gpEach = { prices.price(Config.ore) })
+            gpEach = { prices.price(currentOreName()) })
     }
 
-    private val routine by lazy {
-        Gatherer(
+    private fun currentOre(): Ore = Ore.fromDisplay(Config.ore)
+    private fun currentOreName(): String = currentOre().product ?: ""
+
+    /** The chosen site for the current ore, resolved live (honours "Auto — select best"). */
+    private fun currentSite(): MineSite? =
+        MineSites.siteFor(currentOre(), ctx, Config.location, banking = Config.bank)
+
+    private fun gearUp(): Long? = if (Config.getBestPickaxe) pickaxe.ensure() else null
+
+    private val normal by lazy {
+        NormalMiner(
             ctx,
-            // The live object sometimes reports the generic "Rocks" name — fall back to it.
-            findResource = {
-                objects.query().named(Config.rock).withAction("Mine").nearest()
-                    ?: objects.query().named("Rocks").withAction("Mine").nearest()
-            },
-            action = { "Mine" },
-            products = { listOf(ItemRef(Config.ore)) },
-            onFull = { if (Config.bank) OnFull.BANK else OnFull.DROP },
-            homeTile = { configuredTile(Config.home) },
-            gearUp = { if (Config.getBestPickaxe) pickaxe.ensure() else null },
-            resourceName = { Config.rock.takeIf { Config.walk && it.isNotBlank() } },
-            resourceKind = ResourceKind.OBJECT,
-            options = LoopOptions(
-                lockInput = { Config.lockInput },
-                stopReason = { stops.reason() },
-                dropParams = { DropParams(Config.minDrop, Config.maxDrop, 5, 400, 900) },
-            ),
+            site = { currentSite() },
+            rockName = { currentOre().rockName ?: "Rocks" },
+            oreName = { currentOreName() },
+            bank = { Config.bank },
+            gearUp = { gearUp() },
+            dropPace = { Config.minDrop to Config.maxDrop },
+            dropGems = { Config.dropGems },
             stats = stats,
+            lockInput = { Config.lockInput },
+            stopReason = { stops.reason() },
+        )
+    }
+
+    private val motherlode by lazy {
+        MotherlodeRoutine(
+            ctx,
+            useUpper = { Config.mlmUpper },
+            repairWheel = { Config.mlmRepair },
+            gearUp = { gearUp() },
+            dropGems = { Config.dropGems },
+            highlight = { Config.highlightObjects },
+            stats = stats,
+            lockInput = { Config.lockInput },
+            stopReason = { stops.reason() },
         )
     }
 
     override fun onStart() {
         stats.start()
-        stats.carried = { inventory.count(Config.ore) }
-        syncOreToRock() // heal any saved rock/ore mismatch on start
+        stats.carried = {
+            if (Config.isMotherlode) inventory.count("Pay-dirt") else inventory.count(currentOreName())
+        }
     }
 
-    /** Keep the "Ore name" in step with the chosen rock (e.g. "Iron rocks" → "Iron ore"). The generic
-     *  "Rocks" object has no known product, so it's left as configured. */
-    override fun onConfigChanged(key: String) { if (key == "rock") syncOreToRock() }
-
-    private fun syncOreToRock() {
-        val ore = drops.primary(Config.rock) ?: return
-        if (ore != Config.ore) Config.ore = ore
+    /** Reset the location to "Auto — select best" when the ore changes — a label for the old ore is invalid. */
+    override fun onConfigChanged(key: String) {
+        if (key == "ore") Config.location = MineSites.BEST
     }
 
-    override fun onStop() { if (input.isLocked()) input.unlock() }
+    override fun onStop() {
+        normal.releaseInput()
+        motherlode.releaseInput()
+    }
 
-    override fun onLoop(): Long = routine.tick()
+    override fun onLoop(): Long =
+        if (Config.isMotherlode) motherlode.tick() else normal.tick()
 
     override fun overlayTitle() = "Mining"
 
-    override fun onOverlay(gui: ScriptGui) {
-        val worth = stats.output() * prices.price(Config.ore)
-        SkillOverlay.render(gui, stats, listOf(
-            "Target" to Config.rock,
-            (if (Config.bank) "Ore banked" else "Ore dropped")
-                to "${SkillOverlay.commas(stats.output())} (${SkillOverlay.compact(stats.perHour(worth))} gp/hr)",
-        ))
+    override fun onOverlay(gui: ScriptGui) = profile("miner/overlay") {
+        val target = if (Config.isMotherlode) "Motherlode" else "${currentOre().display} — ${Config.location}"
+        val rows = if (Config.isMotherlode) {
+            listOf("Target" to target, "Ore banked" to MinerOverlay.commas(stats.output()))
+        } else {
+            val worth = stats.output() * prices.price(currentOreName())
+            listOf(
+                "Target" to target,
+                (if (Config.bank) "Ore banked" else "Ore dropped")
+                    to "${MinerOverlay.commas(stats.output())} (${MinerOverlay.compact(stats.perHour(worth))} gp/hr)",
+            )
+        }
+        MinerOverlay.render(gui, stats, rows)
     }
 }
