@@ -3,10 +3,9 @@ apply plugin: 'io.osrsx.plugin'
 osrsxPlugin {
     id = 'miner'
     group = 'io.osrsx.plugins'
-    version = '1.1.0'
+    version = '2.0.0'
     name = 'Miner'
-    description = 'Mines a configured rock and drops or banks the ore.'
+    description = 'Mines a chosen ore at a chosen location, with the right requirements per site.'
     authors = ['osrsx']
     tags = ['skilling', 'mining', 'gathering']
-    requires 'skilling-lib:1.0.0'
 }
