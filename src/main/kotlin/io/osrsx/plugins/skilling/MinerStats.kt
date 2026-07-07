@@ -3,6 +3,17 @@ package io.osrsx.plugins.skilling
 import io.osrsx.api.PluginContext
 import io.osrsx.api.Skill
 import io.osrsx.plugin.ScriptGui
+import java.util.concurrent.ThreadLocalRandom
+
+/**
+ * A humanized loop delay biased toward the SHORT end: most samples sit near [minMs] with a thin tail out to
+ * [maxMs] (cubed uniform), so the bot reacts quickly the vast majority of the time while still varying over a
+ * wide range. Snappier and less robotic than a flat `uniform(min, max)`.
+ */
+fun snap(minMs: Int, maxMs: Int): Long {
+    val u = ThreadLocalRandom.current().nextDouble()
+    return (minMs + (maxMs - minMs) * u * u * u).toLong()
+}
 
 /**
  * Per-run bookkeeping for the miner — elapsed time, Mining XP + rates, a live status word and a tally of ore

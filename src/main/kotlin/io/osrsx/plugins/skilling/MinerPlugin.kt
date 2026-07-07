@@ -5,6 +5,7 @@ import io.osrsx.config.PluginConfig
 import io.osrsx.config.and
 import io.osrsx.config.eq
 import io.osrsx.config.isFalse
+import io.osrsx.config.isTrue
 import io.osrsx.config.notEq
 import io.osrsx.plugin.HasOverlay
 import io.osrsx.plugin.Plugin
@@ -52,6 +53,14 @@ class MinerPlugin : Plugin(), HasOverlay {
         var mlmUpper by boolItem("mlmUpper", "Use upper level", false,
             "Motherlode: mine the upper level (57 Mining) — climbs the ladder up first",
             section = "Setup", visibleIf = eq("ore", MLM))
+
+        var mlmRepair by boolItem("mlmRepair", "Repair water wheel", true,
+            "Motherlode: fix broken water-wheel struts (needs a hammer) so the sack keeps filling",
+            section = "Setup", visibleIf = eq("ore", MLM))
+
+        var mlmKeepHammer by boolItem("mlmKeepHammer", "Keep a hammer", true,
+            "Carry a hammer (grabbed while banking) for repairs; off = fetch one from the bank only when a strut breaks",
+            section = "Setup", visibleIf = eq("ore", MLM) and isTrue("mlmRepair"))
 
         var minDrop by intItem("minDrop", "Min drop (ms)", 90, 20, 2000, "Fastest per-item pause when power-dropping",
             "Ore", visibleIf = isFalse("bank") and notEq("ore", MLM))
@@ -108,6 +117,8 @@ class MinerPlugin : Plugin(), HasOverlay {
         MotherlodeRoutine(
             ctx,
             useUpper = { Config.mlmUpper },
+            repairWheel = { Config.mlmRepair },
+            keepHammer = { Config.mlmKeepHammer },
             gearUp = { gearUp() },
             stats = stats,
             lockInput = { Config.lockInput },

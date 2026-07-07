@@ -5,7 +5,6 @@ import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.get
 import io.osrsx.api.section
-import io.osrsx.util.Rng
 
 /**
  * The routine for the ordinary rock ores (copper/tin/iron/coal): web-walk to the chosen catalogued [MineSite]
@@ -43,16 +42,16 @@ class NormalMiner(
     }
 
     private fun mine(): Long = ctx.profiler().section("miner/mine") {
-        if (loop.isAnimating()) { stats.status = "mining"; return@section Rng.uniform(600, 1100) }
+        if (loop.isAnimating()) { stats.status = "mining"; return@section snap(250, 900) }
 
-        val target = site() ?: run { stats.status = "no location"; return@section Rng.uniform(1500, 2500) }
+        val target = site() ?: run { stats.status = "no location"; return@section snap(1200, 2500) }
 
         // Not at the chosen site yet → web-walk to its anchor.
         val me = ctx.players().localPlayer()?.tile()
         if (me == null || me.distanceTo(target.tile) > ARRIVE_RADIUS) {
             stats.status = "walking"
             ctx.webWalking().walkTo(target.tile)
-            return@section Rng.uniform(600, 1000)
+            return@section snap(300, 1100)
         }
 
         // At the site → mine the nearest reachable, close-enough rock.
@@ -60,24 +59,24 @@ class NormalMiner(
         if (rock != null && rock.distance() <= INTERACT_RANGE && loop.canReach(rock)) {
             stats.status = "mining"
             rock.interact("Mine")
-            return@section Rng.uniform(1200, 2000)
+            return@section snap(400, 1800)
         }
         stats.status = "waiting" // rocks respawning
-        Rng.uniform(1200, 2400)
+        snap(600, 2000)
     }
 
     private fun bankOre(): Long = ctx.profiler().section("miner/bank") {
         val banking = ctx.services().get<BankingService>() ?: return@section dropOre()
         stats.status = "banking"
         if (!banking.isOpen()) {
-            return@section if (banking.openNearest()) Rng.uniform(500, 900) else Rng.uniform(1000, 1600)
+            return@section if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
         }
         val name = oreName()
         val before = ctx.inventory().count(name)
         banking.deposit(ItemRef.ByName(name))
         banking.close()
         stats.addProduced((before - ctx.inventory().count(name)).coerceAtLeast(0))
-        Rng.uniform(600, 1000)
+        snap(400, 1000)
     }
 
     private fun dropOre(): Long = ctx.profiler().section("miner/drop") {
@@ -87,7 +86,7 @@ class NormalMiner(
         val before = ctx.inventory().count(name)
         ctx.inventory().drop(name, -1, min, max, 5, 400, 900)
         stats.addProduced((before - ctx.inventory().count(name)).coerceAtLeast(0))
-        Rng.uniform(400, 800)
+        snap(300, 800)
     }
 
     private companion object {
