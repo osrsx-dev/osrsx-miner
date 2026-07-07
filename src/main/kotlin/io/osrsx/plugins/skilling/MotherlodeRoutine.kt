@@ -34,14 +34,14 @@ class MotherlodeRoutine(
 ) {
     private val loop = MinerLoop(ctx, lockInput, stopReason) { step() }
 
-    /** True while emptying a full sack — set once we've deposited a sack's worth, cleared once it's empty. */
+    /** True while emptying a full sack — set once the sack is full, cleared once it's empty. */
     private var draining = false
 
-    /** Pay-dirt held last loop, cumulative pay-dirt deposited, and ore banked back — so we judge the sack from
-     *  what we PUT IN / GOT BACK, not the ~10s-laggy sack varbit. */
-    private var lastPayDirt = 0
-    private var deposited = 0
-    private var collected = 0
+    /** Set when we deposit the load that TOPS OFF the sack, so we drain immediately instead of waiting ~10s
+     *  for the sack varbit to catch up to full. */
+    private var toppedOff = false
+
+    /** For a robust drain EXIT: only stop once the sack has actually been emptied (guards the wash-lag "0"). */
     private var collectedAny = false
     private var emptyStreak = 0
 
@@ -59,35 +59,30 @@ class MotherlodeRoutine(
         stats.status = "gearing up"
         gearUp()?.let { return it }
 
-        // Track pay-dirt deposits (a drop in held pay-dirt = we fed the hopper) to know the sack's fill from
-        // what we've put in — the sack varbit lags the last deposit by ~10s.
         val payDirt = ctx.inventory().count(PAY_DIRT)
-        if (payDirt < lastPayDirt) deposited += (lastPayDirt - payDirt)
-        lastPayDirt = payDirt
-
         val haveOre = MLM_ORES.any { ctx.inventory().contains(it) } || ctx.inventory().contains(NUGGET)
         val capacity = sackCapacity()
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
+        val spaceLeft = (capacity - sackNow).coerceAtLeast(0) // EXACT room left in the sack (live varbit)
 
-        // Enter drain only after a FULL load is deposited (payDirt back to 0) and we've fed ~a whole sack.
-        // The "one more load" headroom is the inventory's ACTUAL pay-dirt capacity (counts real empty slots,
-        // so a held pickaxe/hammer is accounted for) rather than a hardcoded guess.
-        if (!draining && payDirt == 0 && deposited >= capacity - payDirtCapacity()) {
-            draining = true; collected = 0; collectedAny = false; emptyStreak = 0
+        // Enter drain the instant the sack is full: the varbit shows no space, OR we just deposited the load
+        // that tops it off (so we don't wait ~10s for the varbit to catch up).
+        if (!draining && payDirt == 0 && (spaceLeft == 0 || toppedOff)) {
+            draining = true; toppedOff = false; collectedAny = false; emptyStreak = 0
         }
-        // Exit drain only once the sack is confirmed empty for a couple of loops AFTER we've actually collected
-        // (so the wash-lag "0" right after depositing doesn't end it early), or we've banked back all we fed in.
+        // Exit once the sack is confirmed empty for a couple of loops AFTER we've actually collected (guards the
+        // wash-lag "0" right after topping off).
         if (draining) {
-            if (sackNow > 0) emptyStreak = 0
-            else if (collectedAny && !haveOre && payDirt == 0) emptyStreak++
-            if (emptyStreak >= 2 || (collectedAny && collected >= deposited)) {
-                draining = false; deposited = 0; collected = 0; collectedAny = false; emptyStreak = 0
-            }
+            if (sackNow > 0) emptyStreak = 0 else if (collectedAny && !haveOre && payDirt == 0) emptyStreak++
+            if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0 }
         }
 
         return when {
             draining && haveOre -> bankOre()   // bank each collected load...
             draining -> collect()              // ...and keep collecting until the sack is empty
+            // We hold enough pay-dirt to fill the sack → stop mining and deposit it now (tops the sack off).
+            payDirt > 0 && spaceLeft in 1..payDirt -> { toppedOff = true; whenFull() }
+            // Otherwise deposit a full load whenever the inventory fills.
             ctx.inventory().isFull() && payDirt > 0 -> whenFull()
             else -> mine()
         }
@@ -168,7 +163,6 @@ class MotherlodeRoutine(
         // Top up a hammer while we're here so repairs never need a dedicated trip.
         if (repairWheel() && keepHammer() && !haveHammer()) ctx.bank().withdraw("Hammer", 1)
         banking.close()
-        collected += before
         stats.addProduced((before - countAll(MLM_ORES)).coerceAtLeast(0))
         snap(400, 1000)
     }
@@ -221,10 +215,6 @@ class MotherlodeRoutine(
     // ---- Sack fill -----------------------------------------------------------------------------------
 
     private fun sackCapacity(): Int = if (ctx.varps().varbit(BIGGER_SACK) == 1) SACK_LARGE else SACK_SMALL
-
-    /** How many pay-dirt one inventory can hold right now — real empty slots plus any pay-dirt already held —
-     *  so the equipped/held pickaxe and hammer are accounted for instead of assuming a fixed number. */
-    private fun payDirtCapacity(): Int = ctx.inventory().emptySlotCount() + ctx.inventory().count(PAY_DIRT)
 
     private fun haveHammer(): Boolean = ctx.inventory().contains("Hammer") || ctx.inventory().contains("Imcando hammer")
 
