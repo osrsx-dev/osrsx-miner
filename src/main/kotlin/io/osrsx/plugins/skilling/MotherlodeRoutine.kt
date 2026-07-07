@@ -287,9 +287,17 @@ class MotherlodeRoutine(
      *  the live "Climb" action so it works regardless of which ladder object id the floor uses. */
     private fun ladder(): SceneEntity? = ctx.objects().query().named("Ladder").withAction("Climb").nearest()
 
-    /** The nearest ore vein on OUR floor (see [nearestOnFloor]) — never one on the other floor stacked at the
-     *  same world tile, which we couldn't reach. */
-    private fun floorVein(): SceneEntity? = nearestOnFloor(ORE_VEINS)
+    /** The nearest ore vein on OUR floor that we can actually REACH — filtered by local scene-collision
+     *  ([Walking.canReachToInteract]) so a vein walled off by a rockfall (common up top) is skipped for the
+     *  next reachable one, and by tile height so it's never a vein on the other floor stacked at the same tile. */
+    private fun floorVein(): SceneEntity? {
+        val me = ctx.players().localPlayer()?.tileHeight() ?: return null
+        return ctx.objects().query().id(*ORE_VEINS).withAction("Mine").within(INTERACT_RANGE).sortNearest().list()
+            .firstOrNull { v ->
+                val t = v.tile() ?: return@firstOrNull false
+                (v.tileHeight() < UPPER_FLOOR_HEIGHT) == (me < UPPER_FLOOR_HEIGHT) && ctx.walking().canReachToInteract(t)
+            }
+    }
 
     /** The still-minable ore vein AT tile [t] on our floor, or null once it's depleted (no longer an "Ore vein"
      *  with a Mine action there). Lets us keep working one vein until it collapses. */
