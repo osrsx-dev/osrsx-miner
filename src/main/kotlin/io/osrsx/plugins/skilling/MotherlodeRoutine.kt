@@ -45,9 +45,14 @@ class MotherlodeRoutine(
     private var collectedAny = false
     private var emptyStreak = 0
 
-    /** Debounces so a single "Search"/"Deposit" click isn't re-issued while we're still walking to it. */
-    private var lastSearchMs = 0L
-    private var lastDepositMs = 0L
+    /** Interaction latches — set when a click actually LANDS ([SceneEntity.leftClickIfDefault] returns true)
+     *  and cleared by the deterministic world-state change that click causes (bank opens / sack count drops /
+     *  held pay-dirt drops). So we never re-issue an action we've already triggered — no timers, no polling. */
+    private var searching = false
+    private var sackAtSearch = 0
+    private var depositing = false
+    private var payDirtAtDeposit = 0
+    private var bankOpening = false
 
     /** Consecutive on-demand hammer-fetch attempts that didn't yield one — stops retrying if the bank has none. */
     private var hammerFetchTries = 0
@@ -128,34 +133,33 @@ class MotherlodeRoutine(
 
     private fun deposit(): Long = ctx.profiler().section("miner/mlm-deposit") {
         val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(ANCHOR); return@section snap(300, 1200) }
-        val now = System.currentTimeMillis()
-        if (now - lastDepositMs < DEPOSIT_DEBOUNCE_MS) return@section snap(250, 700)
+        val payDirt = ctx.inventory().count(PAY_DIRT)
+        // We already clicked Deposit and the pay-dirt hasn't left yet → the action is in flight, don't re-click.
+        if (depositing && payDirt >= payDirtAtDeposit) return@section snap(250, 700)
+        depositing = false
         stats.status = "depositing"
-        leftOrMenu(hopper, "Deposit")
-        lastDepositMs = now
+        payDirtAtDeposit = payDirt
+        if (hopper.leftClickIfDefault("Deposit")) depositing = true // the click LANDED → latch until pay-dirt drops
         snap(500, 1400)
     }
 
     private fun collect(): Long = ctx.profiler().section("miner/mlm-collect") {
         val sack = sack() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(SACK_ANCHOR); return@section snap(300, 1200) }
-        val now = System.currentTimeMillis()
-        if (now - lastSearchMs < SEARCH_DEBOUNCE_MS) return@section snap(250, 700)
+        val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
+        // We already clicked Search and the sack hasn't drained yet → the action is in flight, don't re-click.
+        if (searching && sackNow >= sackAtSearch) return@section snap(250, 700)
+        searching = false
         stats.status = "collecting"
-        leftOrMenu(sack, "Search")
-        lastSearchMs = now
+        sackAtSearch = sackNow
+        if (sack.leftClickIfDefault("Search")) searching = true // the click LANDED → latch until the sack drops
         snap(500, 1300)
     }
 
     private fun bankOre(): Long = ctx.profiler().section("miner/mlm-bank") {
         val banking = ctx.services().get<BankingService>() ?: return@section snap(700, 1600)
         stats.status = "banking"
-        if (!banking.isOpen()) {
-            // Walk straight to the sack-side bank chest and Use it (no intermediate detour). openNearest is
-            // only a fallback if the chest isn't in the loaded scene.
-            val chest = bankChest()
-            return@section if (chest != null) { leftOrMenu(chest, "Use"); snap(400, 1000) }
-            else if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
-        }
+        if (!banking.isOpen()) return@section openBank(banking)
+        bankOpening = false
         val before = countAll(MLM_ORES)
         if (before > 0) collectedAny = true
         // Single "Deposit inventory" button — banks ore, nuggets and clutter; the equipped pickaxe stays.
@@ -171,15 +175,25 @@ class MotherlodeRoutine(
     private fun fetchHammer(): Long = ctx.profiler().section("miner/mlm-hammer") {
         val banking = ctx.services().get<BankingService>() ?: return@section snap(700, 1600)
         stats.status = "getting hammer"
-        if (!banking.isOpen()) {
-            val chest = bankChest()
-            return@section if (chest != null) { leftOrMenu(chest, "Use"); snap(400, 1000) }
-            else if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
-        }
+        if (!banking.isOpen()) return@section openBank(banking)
+        bankOpening = false
         if (haveHammer()) { banking.close(); hammerFetchTries = 0; return@section snap(400, 900) }
         ctx.bank().withdraw("Hammer", 1)
         hammerFetchTries++
         snap(400, 900)
+    }
+
+    /** Open the sack-side bank chest with a single left-click ("Use" is its default) and WAIT for the bank to
+     *  open — we latch on the landed click so we never re-click the chest once it's already opening/open (which
+     *  is what caused a stray right-click landing inside the open bank UI). openNearest is only a last resort. */
+    private fun openBank(banking: BankingService): Long {
+        if (bankOpening) return snap(300, 900) // already clicked Use — wait for it, don't click again
+        val chest = bankChest()
+        if (chest != null) {
+            if (chest.leftClickIfDefault("Use")) bankOpening = true
+            return snap(400, 1000)
+        }
+        return if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
     }
 
     private fun repair(): Long = ctx.profiler().section("miner/mlm-repair") {
@@ -242,8 +256,6 @@ class MotherlodeRoutine(
         const val SACK_LARGE = 189
 
         const val INTERACT_RANGE = 15
-        const val SEARCH_DEBOUNCE_MS = 2500L
-        const val DEPOSIT_DEBOUNCE_MS = 2000L
         const val MAX_HAMMER_TRIES = 4
 
         const val PAY_DIRT = "Pay-dirt"
