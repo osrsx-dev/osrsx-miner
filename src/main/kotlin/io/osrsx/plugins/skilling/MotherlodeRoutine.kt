@@ -58,8 +58,10 @@ class MotherlodeRoutine(
     private var payDirtAtDeposit = 0
     private var bankOpening = false
 
-    /** Consecutive on-demand hammer-fetch attempts that didn't yield one — stops retrying if the bank has none. */
-    private var hammerFetchTries = 0
+    /** Consecutive hopper deposits that DIDN'T reduce our pay-dirt — i.e. the deposit was rejected because the
+     *  wheel is stopped and the machine has backed up. We only bother repairing after this hits 2 (assume the
+     *  deposit works and someone else fixes the wheel; only step in when it's clearly stuck). */
+    private var depositFails = 0
 
     fun tick(): Long = loop.tick()
     fun releaseInput() = loop.releaseInput()
@@ -94,17 +96,17 @@ class MotherlodeRoutine(
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
 
-        // Wheel stopped (BOTH struts broken) → the sack won't fill, so fix it. Repairing needs a hammer;
-        // fetching one from the bank needs a FREE slot, so if the inventory is full of pay-dirt we deposit a
-        // load first (it queues in the stopped machine and washes once repaired). This is what unsticks the
-        // "full inventory + no hammer" case. Skipped while draining (we're at the sack, not the wheel).
-        if (repairWheel() && !draining && brokenStruts() >= 2) {
-            if (haveHammer) return repair()
-            if (hammerFetchTries < MAX_HAMMER_TRIES) return if (full) deposit() else fetchHammer()
-            // else: no hammer obtainable — fall through and keep mining (a passer-by may repair it).
-        }
+        // Wheel repair is a LAST resort, not proactive: on the busy upper level we assume our deposits go
+        // through and that another player fixes a broken strut. Only if our own deposits have failed twice
+        // (machine backed up), we're up top, there are ≥3 players around, and we happen to hold a hammer do we
+        // fix it ourselves. Never bothers on the lower floor / in a quiet world / without a hammer.
+        if (repairWheel() && haveHammer && !draining && onUpperFloor() && depositFails >= 2 &&
+            ctx.players().all().size >= MIN_PLAYERS_TO_REPAIR && brokenStruts() >= 2
+        ) return repair()
 
         return when {
+            // The sack + bank are on the LOWER floor — climb down first if we mined up top.
+            draining && onUpperFloor() -> descend()
             draining && haveOre -> bankOre()   // bank each collected load...
             draining -> collect()              // ...and keep collecting until the sack is empty
             // We hold enough pay-dirt to top the sack off AND it still has room → deposit now (fills it, then
@@ -123,52 +125,56 @@ class MotherlodeRoutine(
         if (loop.isAnimating()) { stats.status = "mining"; return@section snap(250, 900) }
         closeStrayBank()?.let { return@section it }
 
-        if (useUpper()) {
-            climbUp()?.let {
-                stats.status = "climbing"
-                it.interact("Climb-up")
-                return@section snap(1000, 2200)
+        // Upper level preferred + accessible → climb the ladder up before mining (optional: falls back to the
+        // lower floor if we can't reach the ladder).
+        if (useUpper() && !onUpperFloor()) {
+            val ladder = ladder()
+            if (ladder != null && ladder.distance() <= INTERACT_RANGE) {
+                stats.status = "climbing up"
+                leftOrMenu(ladder, "Climb")
+                return@section snap(1500, 2800)
             }
+            stats.status = "walking"
+            ctx.webWalking().walkTo(LADDER_TILE)
+            return@section snap(300, 1200)
         }
 
-        // Right after a bank trip, walk back to the ANCHOR cluster ONCE before resuming — so we don't mine
-        // sub-optimal veins next to the bank. This is a one-shot (not a per-loop distance gate, which would
-        // fight the small drift of walking onto each vein and stall).
+        val anchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
+        // Right after a bank trip, walk back to the vein cluster ONCE before resuming (one-shot, not a per-loop
+        // gate — which would fight the small drift of walking onto each vein).
         val me = ctx.players().localPlayer()?.tile()
         if (returnToAnchor) {
-            if (me != null && me.distanceTo(ANCHOR) <= ARRIVE_RADIUS) {
-                returnToAnchor = false
-            } else {
-                stats.status = "walking"
-                ctx.webWalking().walkTo(ANCHOR)
-                return@section snap(300, 1200)
-            }
+            if (me != null && me.distanceTo(anchor) <= ARRIVE_RADIUS) returnToAnchor = false
+            else { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
         }
 
-        // Mine the nearest vein BY LOCAL PATH — in front of us and reachable, so a vein across a wall (which
-        // sorts as unreachable) is never targeted, fixing the "clicks a vein through the wall" case.
-        val vein = ctx.objects().query().id(*ORE_VEINS).withAction("Mine").nearestByPath()
+        // Mine the nearest vein ON OUR FLOOR — never one on the other floor stacked at the same world tile.
+        val vein = floorVein()
         if (vein != null && vein.distance() <= INTERACT_RANGE) {
             stats.status = "mining"
             leftOrMenu(vein, "Mine")
             return@section snap(400, 1800)
         }
-        // Nothing minable in reach → head to the anchor cluster (the walker handles rockfalls / the route in).
         stats.status = "walking"
-        ctx.webWalking().walkTo(ANCHOR)
+        ctx.webWalking().walkTo(anchor)
         snap(300, 1200)
     }
 
     private fun deposit(): Long = ctx.profiler().section("miner/mlm-deposit") {
         closeStrayBank()?.let { return@section it }
-        val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(ANCHOR); return@section snap(300, 1200) }
+        val anchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
+        val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
         val payDirt = ctx.inventory().count(PAY_DIRT)
-        // We already clicked Deposit and the pay-dirt hasn't left yet → the action is in flight, don't re-click.
-        if (depositing && payDirt >= payDirtAtDeposit) return@section snap(250, 700)
-        depositing = false
+        // A click landed last loop; judge the outcome now: pay-dirt dropped ⇒ it went through (reset the fail
+        // count); unchanged ⇒ the deposit was rejected (machine backed up) ⇒ count a failure.
+        if (depositing) {
+            depositing = false
+            if (payDirt < payDirtAtDeposit) depositFails = 0 else depositFails++
+            return@section snap(250, 700)
+        }
         stats.status = "depositing"
         payDirtAtDeposit = payDirt
-        if (hopper.leftClickIfDefault("Deposit")) depositing = true // the click LANDED → latch until pay-dirt drops
+        if (hopper.leftClickIfDefault("Deposit")) depositing = true // the click LANDED → judge the outcome next loop
         snap(500, 1400)
     }
 
@@ -204,18 +210,6 @@ class MotherlodeRoutine(
         snap(400, 1000)
     }
 
-    /** Fetch a hammer from the bank (on-demand repair path). Gives up after [MAX_HAMMER_TRIES] if none found. */
-    private fun fetchHammer(): Long = ctx.profiler().section("miner/mlm-hammer") {
-        val banking = ctx.services().get<BankingService>() ?: return@section snap(700, 1600)
-        stats.status = "getting hammer"
-        if (!banking.isOpen()) return@section openBank(banking)
-        bankOpening = false
-        if (haveHammer()) { banking.close(); hammerFetchTries = 0; return@section snap(400, 900) }
-        ctx.bank().withdraw("Hammer", 1)
-        hammerFetchTries++
-        snap(400, 900)
-    }
-
     /** Open the sack-side bank chest with a single left-click ("Use" is its default) and WAIT for the bank to
      *  open — we latch on the landed click so we never re-click the chest once it's already opening/open (which
      *  is what caused a stray right-click landing inside the open bank UI). openNearest is only a last resort. */
@@ -227,6 +221,19 @@ class MotherlodeRoutine(
             return snap(400, 1000)
         }
         return if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
+    }
+
+    /** Climb the ladder DOWN to the lower floor (the sack + bank live there) before draining. */
+    private fun descend(): Long = ctx.profiler().section("miner/mlm-descend") {
+        val ladder = ladder()
+        if (ladder != null && ladder.distance() <= INTERACT_RANGE) {
+            stats.status = "climbing down"
+            leftOrMenu(ladder, "Climb")
+            return@section snap(1500, 2800)
+        }
+        stats.status = "walking"
+        ctx.webWalking().walkTo(LADDER_TILE)
+        snap(300, 1200)
     }
 
     private fun repair(): Long = ctx.profiler().section("miner/mlm-repair") {
@@ -259,13 +266,35 @@ class MotherlodeRoutine(
 
     // ---- Scene queries -------------------------------------------------------------------------------
 
-    private fun hopper(): SceneEntity? = ctx.objects().query().id(HOPPER).nearest()
-    private fun sack(): SceneEntity? = ctx.objects().query().id(SACK).nearest()
+    /** The hopper ON OUR FLOOR (nearest). MLM stacks both floors' objects at the same world tile/plane, so we
+     *  pick by tile HEIGHT — otherwise upstairs we'd try to deposit in the unreachable lower hopper. */
+    private fun hopper(): SceneEntity? = nearestOnFloor(HOPPER)
+    private fun sack(): SceneEntity? = ctx.objects().query().id(SACK).nearest() // sack is lower-floor only
     private fun bankChest(): SceneEntity? = ctx.objects().query().id(BANK_CHEST).nearest()
     private fun strut(): SceneEntity? = ctx.objects().query().id(STRUT_BROKEN).nearest()
     /** How many wheel struts are broken (the wheel stops only when BOTH are). */
     private fun brokenStruts(): Int = ctx.objects().query().id(STRUT_BROKEN).count()
-    private fun climbUp(): SceneEntity? = ctx.objects().query().withAction("Climb-up").nearest()
+    /** The ladder between floors (its action is just "Climb", up from the bottom / down from the top). */
+    private fun ladder(): SceneEntity? = ctx.objects().query().id(*LADDERS).withAction("Climb").nearest()
+
+    /** The nearest ore vein on OUR floor (see [nearestOnFloor]) — never one on the other floor stacked at the
+     *  same world tile, which we couldn't reach. */
+    private fun floorVein(): SceneEntity? = nearestOnFloor(ORE_VEINS)
+
+    // ---- Floors (Motherlode overlays its two levels at the same tile+plane; only tile HEIGHT differs) -----
+
+    private fun myHeight(): Int = ctx.players().localPlayer()?.tileHeight() ?: 0
+    private fun onUpperFloor(): Boolean = myHeight() < UPPER_FLOOR_HEIGHT
+    private fun sameFloor(h: Int): Boolean = (h < UPPER_FLOOR_HEIGHT) == (myHeight() < UPPER_FLOOR_HEIGHT)
+
+    /** Nearest object of [ids] that's on the SAME floor as us. Candidates are limited to nearby tiles first
+     *  (cheap) and only those are height-checked, so it's a handful of client hops, not one per scene object. */
+    private fun nearestOnFloor(ids: IntArray): SceneEntity? {
+        val me = ctx.players().localPlayer()?.tileHeight() ?: return null
+        return ctx.objects().query().id(*ids).within(INTERACT_RANGE).sortNearest().list()
+            .firstOrNull { (it.tileHeight() < UPPER_FLOOR_HEIGHT) == (me < UPPER_FLOOR_HEIGHT) }
+    }
+    private fun nearestOnFloor(id: Int): SceneEntity? = nearestOnFloor(intArrayOf(id))
 
     // ---- Sack fill -----------------------------------------------------------------------------------
 
@@ -283,8 +312,17 @@ class MotherlodeRoutine(
         /** Fallback stand tile by the sack (right next to the bank) when the sack is momentarily out of scene. */
         val SACK_ANCHOR = Tile(3748, 5659, 0)
 
+        /** The upper level's veins sit at a lower rendered tile height than the lower level's (RuneLite's
+         *  own Motherlode plugin uses the same threshold). Height < this ⇒ we're on the upper floor. */
+        const val UPPER_FLOOR_HEIGHT = -490
+
+        /** Where to mine on the upper floor (by the top of the ladder / upper vein cluster), and the ladder. */
+        val UPPER_ANCHOR = Tile(3755, 5679, 0)
+        val LADDER_TILE = Tile(3755, 5673, 0)
+
         // net.runelite.api.gameval.ObjectID
         val ORE_VEINS = intArrayOf(26661, 26662, 26663, 26664) // MOTHERLODE_ORE_SINGLE/LEFT/MIDDLE/RIGHT
+        val LADDERS = intArrayOf(19044, 19045)                  // MOTHERLODE_LADDER_BOTTOM/TOP
         const val STRUT_BROKEN = 26670                          // MOTHERLODE_WHEEL_STRUT_BROKEN ("Hammer" action)
         const val HOPPER = 26674                                // MOTHERLODE_HOPPER
         const val SACK = 26688                                  // MOTHERLODE_SACK (searchable)
@@ -298,7 +336,7 @@ class MotherlodeRoutine(
 
         const val INTERACT_RANGE = 15
         const val ARRIVE_RADIUS = 5 // "arrived" at the anchor when this close
-        const val MAX_HAMMER_TRIES = 4
+        const val MIN_PLAYERS_TO_REPAIR = 3 // only self-repair the wheel in a busy (≥3-player) upper level
         const val INV_SLOTS = 28 // a full inventory (items() returns filled slots)
 
         const val PAY_DIRT = "Pay-dirt"
