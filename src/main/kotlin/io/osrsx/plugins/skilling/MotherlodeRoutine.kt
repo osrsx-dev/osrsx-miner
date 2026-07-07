@@ -240,12 +240,22 @@ class MotherlodeRoutine(
 
     private fun mineVein(vein: SceneEntity): Long {
         stats.status = "mining"
-        // PRECISE click: geometrically lock onto THIS vein's own clickbox footprint. A plain left-click only
-        // verifies the context menu by NAME ("Mine Ore vein"), so when the vein floorVein confirmed reachable
-        // and a DIFFERENT vein across a wall share the same screen hitbox, it clicks whichever is on top —
-        // often the unreachable one, and we stall trying to path to it. Aiming at our vein's footprint (the
-        // foreground one; the walled-off vein sits behind and higher) targets the reachable one.
-        if (!loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) vein.interactPrecise("Mine")
+        if (loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) return snap(400, 1000) // already mining — don't re-issue
+
+        // VERIFY the cursor is over OUR vein before committing. A plain left-click only checks the menu by NAME
+        // ("Mine Ore vein"), and even a precise click can land on a DIFFERENT vein that shares this one's screen
+        // clickbox across a wall. So hover, read what's actually under the cursor, and if it isn't our target
+        // tile, rotate our vein into a clean top-down view (clearing the wall's occlusion) and retry next loop.
+        val vt = vein.tile()
+        vein.hoverPrecise()
+        val hovered = ctx.menu().hoveredTarget()?.tile
+        if (vt != null && hovered != null && hovered != vt) {
+            stats.status = "adjusting view"
+            ctx.camera().rotateToObject(vein)
+            return snap(500, 1100)
+        }
+        // Right vein under the cursor (or no hover info on an older client) → precise click on its footprint.
+        vein.interactPrecise("Mine")
         return snap(400, 1000)
     }
 
@@ -327,9 +337,17 @@ class MotherlodeRoutine(
         bankOpening = false
         val before = countAll(MLM_ORES)
         if (before > 0) collectedAny = true
-        // Bank ONLY the cleaned ore + nuggets — keep the pickaxe, hammer and any held pay-dirt (so we never
-        // bank the tools and have to re-gear, and the hammer stays on us for wheel repairs).
-        banking.deposit(*ORE_REFS)
+        // Menu injection: make "Deposit-All" the DEFAULT left-click for our ore + nuggets for the duration of
+        // this deposit, so each drops with a single natural left-click instead of a right-click-and-select, then
+        // clear the rules the instant we're done so the swap never leaks to any other left-click.
+        val depositRules = MLM_ORE_NAMES.map { ctx.menu().setDefault("Deposit-All", it) }
+        try {
+            // Bank ONLY the cleaned ore + nuggets — keep the pickaxe, hammer and any held pay-dirt (so we never
+            // bank the tools and have to re-gear, and the hammer stays on us for wheel repairs).
+            banking.deposit(*ORE_REFS)
+        } finally {
+            depositRules.forEach { ctx.menu().remove(it) }
+        }
         banking.close()
         stats.addProduced((before - countAll(MLM_ORES)).coerceAtLeast(0))
         snap(400, 1000)
@@ -534,6 +552,9 @@ class MotherlodeRoutine(
 
         /** Everything the sack yields (ores + nuggets) — the "we have something to bank" set. */
         val MLM_ORE_SET = (MLM_ORES + NUGGET).toHashSet()
+
+        /** Same, as a list — used to inject a "Deposit-All" left-click default per name while banking. */
+        val MLM_ORE_NAMES = MLM_ORES + NUGGET
 
         /** Refs to bank (ore + nuggets only) — deposited so the pickaxe, hammer and pay-dirt are kept. */
         val ORE_REFS = (MLM_ORES + NUGGET).map { ItemRef.ByName(it) }.toTypedArray()
