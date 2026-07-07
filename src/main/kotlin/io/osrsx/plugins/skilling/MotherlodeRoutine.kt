@@ -220,7 +220,14 @@ class MotherlodeRoutine(
         // collapsing, so we switch on the object disappearing, NOT on the idle animation (which dips between
         // swings and made us hop veins early). While it's still there, keep working it.
         val current = currentVein?.let { veinAt(it) }
-        if (current != null && current.distance() <= INTERACT_RANGE) return@section mineVein(current)
+        if (current != null && current.distance() <= INTERACT_RANGE) {
+            // CONFIRM against reality: once we're actually mining (animating), track + highlight the vein we're
+            // truly standing beside — a click can land on an overlapping neighbour, so the planned tile isn't a
+            // guarantee. [workedVein] is the minable vein orthogonally adjacent to us (null → keep the plan).
+            val actual = if (loop.isAnimating()) (workedVein() ?: current) else current
+            currentVein = actual.tile()
+            return@section mineVein(actual)
+        }
         currentVein = null
 
         // Upper level preferred + accessible → climb the ladder up before picking a vein (optional: falls back
@@ -495,6 +502,18 @@ class MotherlodeRoutine(
             .firstOrNull { v ->
                 val t = v.tile() ?: return@firstOrNull false
                 (v.tileHeight() < UPPER_FLOOR_HEIGHT) == (me < UPPER_FLOOR_HEIGHT) && ctx.walking().canReachToInteract(t)
+            }
+    }
+
+    /** The minable ore vein we're ACTUALLY working: the one orthogonally adjacent to the player (a mining
+     *  position), on our floor. You can only mine a vein you're standing next to, so this is the ground truth
+     *  for confirming which vein we're on when a click may have landed on a neighbour. Null if none adjacent. */
+    private fun workedVein(): SceneEntity? {
+        val me = ctx.players().localPlayer()?.tile() ?: return null
+        return ctx.objects().query().id(*ORE_VEINS).withAction("Mine").within(1).sortNearest().list()
+            .firstOrNull { v ->
+                val t = v.tile() ?: return@firstOrNull false
+                kotlin.math.abs(t.x - me.x) + kotlin.math.abs(t.y - me.y) == 1 && sameFloor(v.tileHeight())
             }
     }
 
