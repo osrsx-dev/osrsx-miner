@@ -50,9 +50,18 @@ class Pickaxe(private val ctx: PluginContext) {
         val usable = tiers.filter { it.mineLevel <= level } // best-first, level-appropriate
         if (usable.isEmpty()) return@section Plugin.NO_LOOP
 
-        // Already holding or wearing a usable pickaxe → wield it (once) to free a slot, then ready.
-        if (usable.any { ctx.inventory().contains(it.id) || ctx.equipment().contains(it.id) }) {
-            wieldIfCarried(usable)
+        // Read each container ONCE (a single client-thread hop) and match ids locally, instead of a
+        // contains() per tier per container — the latter cost ~40 marshalls every loop.
+        val invIds = ctx.inventory().items().mapTo(HashSet()) { it.id }
+        val equipIds = ctx.equipment().items().mapTo(HashSet()) { it.id }
+
+        // Already wearing a usable pickaxe → ready.
+        if (usable.any { it.id in equipIds }) { wieldTries = 0; return@section null }
+        // Carried but not worn → wield it (a few tries; a too-low Attack level can't, and it still mines from
+        // the inventory), then ready.
+        val carried = usable.firstOrNull { it.id in invIds }
+        if (carried != null) {
+            if (wieldTries < MAX_WIELD_TRIES) { ctx.equipment().equip(carried.id); wieldTries++ }
             return@section null
         }
 
@@ -68,16 +77,6 @@ class Pickaxe(private val ctx: PluginContext) {
             )
         }
         if (ctx.loadouts().apply(loadout)) null else Rng.uniform(400, 800)
-    }
-
-    /** Wield a carried pickaxe (up to [MAX_WIELD_TRIES] tries — a too-low Attack level can't wield it, and it
-     *  still mines from the inventory, so we stop retrying). No-op once one is worn. */
-    private fun wieldIfCarried(usable: List<Tier>) {
-        if (usable.any { ctx.equipment().contains(it.id) }) { wieldTries = 0; return }
-        val carried = usable.firstOrNull { ctx.inventory().contains(it.id) } ?: return
-        if (wieldTries >= MAX_WIELD_TRIES) return
-        ctx.equipment().equip(carried.id)
-        wieldTries++
     }
 
     private companion object {

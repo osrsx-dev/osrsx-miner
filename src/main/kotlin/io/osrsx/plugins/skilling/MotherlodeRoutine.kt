@@ -64,8 +64,14 @@ class MotherlodeRoutine(
         stats.status = "gearing up"
         gearUp()?.let { return it }
 
-        val payDirt = ctx.inventory().count(PAY_DIRT)
-        val haveOre = MLM_ORES.any { ctx.inventory().contains(it) } || ctx.inventory().contains(NUGGET)
+        // ONE inventory snapshot per loop — scan it locally rather than a contains()/count() per item (each of
+        // which was a separate client-thread hop; this is the bulk of the per-loop marshalling).
+        val names = ctx.inventory().items().mapNotNull { it.name }
+        val payDirt = names.count { it == PAY_DIRT }
+        val haveOre = names.any { it in MLM_ORE_SET }
+        val haveHammer = names.any { it == "Hammer" || it == "Imcando hammer" }
+        val full = names.size >= INV_SLOTS
+
         val capacity = sackCapacity()
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
         val spaceLeft = (capacity - sackNow).coerceAtLeast(0) // EXACT room left in the sack (live varbit)
@@ -82,26 +88,25 @@ class MotherlodeRoutine(
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0 }
         }
 
+        // Wheel stopped (BOTH struts broken) → the sack won't fill, so fix it. Repairing needs a hammer;
+        // fetching one from the bank needs a FREE slot, so if the inventory is full of pay-dirt we deposit a
+        // load first (it queues in the stopped machine and washes once repaired). This is what unsticks the
+        // "full inventory + no hammer" case. Skipped while draining (we're at the sack, not the wheel).
+        if (repairWheel() && !draining && brokenStruts() >= 2) {
+            if (haveHammer) return repair()
+            if (hammerFetchTries < MAX_HAMMER_TRIES) return if (full) deposit() else fetchHammer()
+            // else: no hammer obtainable — fall through and keep mining (a passer-by may repair it).
+        }
+
         return when {
             draining && haveOre -> bankOre()   // bank each collected load...
             draining -> collect()              // ...and keep collecting until the sack is empty
             // We hold enough pay-dirt to fill the sack → stop mining and deposit it now (tops the sack off).
-            payDirt > 0 && spaceLeft in 1..payDirt -> { toppedOff = true; whenFull() }
+            payDirt > 0 && spaceLeft in 1..payDirt -> { toppedOff = true; deposit() }
             // Otherwise deposit a full load whenever the inventory fills.
-            ctx.inventory().isFull() && payDirt > 0 -> whenFull()
+            full && payDirt > 0 -> deposit()
             else -> mine()
         }
-    }
-
-    /** Inventory full of pay-dirt: deposit it — unless BOTH struts are broken (the wheel is stopped, so a
-     *  deposit wouldn't wash), in which case fix them first. Only point we ever repair, so mining isn't
-     *  interrupted. Falls back to depositing if no hammer can be obtained. */
-    private fun whenFull(): Long {
-        if (repairWheel() && brokenStruts() >= 2) {
-            if (haveHammer()) return repair()
-            if (hammerFetchTries < MAX_HAMMER_TRIES) return fetchHammer()
-        }
-        return deposit()
     }
 
     // ---- Steps ---------------------------------------------------------------------------------------
@@ -257,11 +262,15 @@ class MotherlodeRoutine(
 
         const val INTERACT_RANGE = 15
         const val MAX_HAMMER_TRIES = 4
+        const val INV_SLOTS = 28 // a full inventory (items() returns filled slots)
 
         const val PAY_DIRT = "Pay-dirt"
         const val NUGGET = "Golden nugget"
         val MLM_ORES = listOf(
             "Runite ore", "Adamantite ore", "Mithril ore", "Gold ore", "Coal", "Silver ore", "Iron ore",
         )
+
+        /** Everything the sack yields (ores + nuggets) — the "we have something to bank" set. */
+        val MLM_ORE_SET = (MLM_ORES + NUGGET).toHashSet()
     }
 }
