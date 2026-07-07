@@ -22,6 +22,7 @@ class NormalMiner(
     private val bank: () -> Boolean,
     private val gearUp: () -> Long?,
     private val dropPace: () -> Pair<Int, Int>,
+    private val dropGems: () -> Boolean,
     private val stats: MinerStats,
     lockInput: () -> Boolean,
     stopReason: () -> String?,
@@ -34,11 +35,19 @@ class NormalMiner(
     private fun step(): Long {
         stats.status = "gearing up"
         gearUp()?.let { return it }
+        if (dropGems() && hasUncutGem(ctx.inventory().items().mapNotNull { it.name })) return dropGemsNow()
         return when {
             !ctx.inventory().isFull() -> mine()
             bank() -> bankOre()
             else -> dropOre()
         }
+    }
+
+    /** Power-drop every uncut gem we're carrying. */
+    private fun dropGemsNow(): Long = ctx.profiler().section("miner/drop-gems") {
+        stats.status = "dropping gems"
+        for (gem in UNCUT_GEMS) if (ctx.inventory().count(gem) > 0) ctx.inventory().drop(gem, -1, 90, 230, 5, 400, 900)
+        snap(200, 500)
     }
 
     private fun mine(): Long = ctx.profiler().section("miner/mine") {

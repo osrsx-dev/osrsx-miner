@@ -15,6 +15,17 @@ fun snap(minMs: Int, maxMs: Int): Long {
     return (minMs + (maxMs - minMs) * u * u * u).toLong()
 }
 
+/** Uncut gems a mining pick can turn up (gem-rock / random gem drops). Matched by name so both routines can
+ *  power-drop them when the "Drop gems" option is on, keeping the inventory clear of clutter. */
+val UNCUT_GEMS: List<String> = listOf(
+    "Uncut sapphire", "Uncut emerald", "Uncut ruby", "Uncut diamond",
+    "Uncut dragonstone", "Uncut opal", "Uncut jade", "Uncut red topaz",
+)
+private val UNCUT_GEM_SET = UNCUT_GEMS.toHashSet()
+
+/** True if [names] (a live inventory name list) contains any uncut gem. */
+fun hasUncutGem(names: List<String>): Boolean = names.any { it in UNCUT_GEM_SET }
+
 /**
  * Per-run bookkeeping for the miner — elapsed time, Mining XP + rates, a live status word and a tally of ore
  * that has left the inventory (dropped or banked). Self-contained (no skilling-lib): everything the overlay

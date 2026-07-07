@@ -49,6 +49,12 @@ class MinerPlugin : Plugin(), HasOverlay {
             "Before mining, wield the best pickaxe your level allows — withdrawn from the bank, or bought if you own none",
             section = "Setup")
 
+        var dropGems by boolItem("dropGems", "Drop gems", true,
+            "Power-drop any uncut gems as they're mined instead of keeping them", section = "Setup")
+
+        var wearProspector by boolItem("wearProspector", "Wear prospector outfit", true,
+            "Equip the Prospector outfit (Mining XP boost) from your bank if you own it", section = "Setup")
+
         var mlmUpper by boolItem("mlmUpper", "Use upper level", false,
             "Motherlode: mine the upper level (57 Mining) — climbs the ladder up first",
             section = "Setup", visibleIf = eq("ore", MLM))
@@ -77,7 +83,13 @@ class MinerPlugin : Plugin(), HasOverlay {
 
     private val stats by lazy { MinerStats(ctx) }
     // For Motherlode with repair on, gearing also keeps a hammer (to fix the water wheel without a bank trip).
-    private val pickaxe by lazy { Pickaxe(ctx, wantHammer = { Config.isMotherlode && Config.mlmRepair }) }
+    private val pickaxe by lazy {
+        Pickaxe(
+            ctx,
+            wantHammer = { Config.isMotherlode && Config.mlmRepair },
+            wearProspector = { Config.wearProspector },
+        )
+    }
     private val stops by lazy {
         StopTargets(stats,
             level = { Config.stopAtLevel }, count = { Config.stopAtOre },
@@ -103,6 +115,7 @@ class MinerPlugin : Plugin(), HasOverlay {
             bank = { Config.bank },
             gearUp = { gearUp() },
             dropPace = { Config.minDrop to Config.maxDrop },
+            dropGems = { Config.dropGems },
             stats = stats,
             lockInput = { Config.lockInput },
             stopReason = { stops.reason() },
@@ -115,6 +128,7 @@ class MinerPlugin : Plugin(), HasOverlay {
             useUpper = { Config.mlmUpper },
             repairWheel = { Config.mlmRepair },
             gearUp = { gearUp() },
+            dropGems = { Config.dropGems },
             stats = stats,
             lockInput = { Config.lockInput },
             stopReason = { stops.reason() },

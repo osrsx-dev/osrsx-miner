@@ -26,6 +26,7 @@ class MotherlodeRoutine(
     private val useUpper: () -> Boolean,
     private val repairWheel: () -> Boolean,
     private val gearUp: () -> Long?,
+    private val dropGems: () -> Boolean,
     private val stats: MinerStats,
     lockInput: () -> Boolean,
     stopReason: () -> String?,
@@ -54,13 +55,34 @@ class MotherlodeRoutine(
      *  held pay-dirt drops). So we never re-issue an action we've already triggered — no timers, no polling. */
     private var searching = false
     private var sackAtSearch = 0
+    private var searchClickedAt = 0L
     private var depositing = false
     private var payDirtAtDeposit = 0
     private var bankOpening = false
+    private var bankClickedAt = 0L
 
-    /** When our deposits first stopped going through (the wheel is stopped / machine backed up), or 0 when the
-     *  last deposit worked. If we can't deposit for [DEPOSIT_STUCK_MS], we fix the strut ourselves. */
-    private var depositStuckSince = 0L
+    /** Pay-dirt we've deposited into the hopper that HASN'T washed into the sack yet. The sack varbit lags the
+     *  hopper (the wheel washes pay-dirt in gradually), so this is the only way to know the true remaining sack
+     *  room — otherwise we'd deposit a fresh load on top of pending wash and overflow. Incremented when a
+     *  deposit lands, decremented as the sack count climbs. Self-heals (a stale value just delays/advances the
+     *  next deposit slightly). [lastSackSeen] is the previous loop's sack count, to measure each loop's wash. */
+    private var hopperPending = 0
+    private var lastSackSeen = -1
+
+    /** The last time the sack count climbed (a wash happened) OR a deposit landed — our reference for "the wheel
+     *  should have washed by now". If we have pay-dirt PENDING in the hopper but the sack hasn't climbed for
+     *  [DEPOSIT_STUCK_MS], the wheel is stopped (both struts broken) and we fix it ourselves. 0 until the first
+     *  deposit, so we never repair before there's anything to wash. */
+    private var lastWashMs = 0L
+
+    /** Climb latch — set when we issue a ladder Climb, cleared only once our FLOOR actually flips. Stops us
+     *  re-clicking the ladder on arrival (which climbs straight back up, bouncing between floors). */
+    private var climbing = false
+    private var climbFromUpper = false
+
+    /** Consecutive loops the anchor has looked unreachable — debounces the trapped-pocket check so a transient
+     *  pathfinder miss doesn't send us mining a rockfall when we aren't actually walled in. */
+    private var trappedStreak = 0
 
     fun tick(): Long = loop.tick()
     fun releaseInput() = loop.releaseInput()
@@ -78,12 +100,25 @@ class MotherlodeRoutine(
         val names = ctx.inventory().items().mapNotNull { it.name }
         val payDirt = names.count { it == PAY_DIRT }
         val haveOre = names.any { it in MLM_ORE_SET }
+        val haveGems = dropGems() && hasUncutGem(names)
         val haveHammer = names.any { it == "Hammer" || it == "Imcando hammer" }
         val full = names.size >= INV_SLOTS
 
+        val now = System.currentTimeMillis()
         val capacity = sackCapacity()
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
-        val spaceLeft = (capacity - sackNow).coerceAtLeast(0) // EXACT room left in the sack (live varbit)
+        // Each loop the sack count climbs, that much pending pay-dirt has washed in from the hopper → retire it,
+        // and note that the wheel IS washing (resets the wheel-down clock).
+        if (lastSackSeen in 0 until sackNow) {
+            hopperPending = (hopperPending - (sackNow - lastSackSeen)).coerceAtLeast(0)
+            lastWashMs = now
+        }
+        lastSackSeen = sackNow
+        // True room left in the sack = capacity − what's IN it − what's already committed (pending in the hopper),
+        // minus one reserved slot. The hopper deposits the whole inventory at once, so if a load doesn't fully
+        // fit it leaves the remainder behind (the "1 pay-dirt left over" bug); reserving one makes the top-off
+        // load always fit, and subtracting `hopperPending` stops us over-committing on top of an unwashed load.
+        val spaceLeft = (capacity - sackNow - hopperPending - SACK_RESERVE).coerceAtLeast(0)
 
         // Enter drain the instant the sack is FULL — even if we're still holding pay-dirt. A full sack can't
         // accept a deposit (the hopper rejects it), so we must empty it first; the held pay-dirt is kept aside
@@ -99,22 +134,49 @@ class MotherlodeRoutine(
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
 
-        // Wheel repair is a last resort: normally we assume deposits work and someone else fixes a broken
-        // strut. But if our own deposits have been stuck for over DEPOSIT_STUCK_MS (the wheel's clearly down),
-        // fix it ourselves — we always carry a hammer for exactly this. The struts are on the LOWER floor, so
-        // climb down to them first if we mined up top (clicking from above does nothing).
-        if (repairWheel() && haveHammer && !draining && depositStuckSince != 0L &&
-            System.currentTimeMillis() - depositStuckSince > DEPOSIT_STUCK_MS && brokenStruts() >= 2
-        ) return if (onUpperFloor()) descend() else repair()
+        // Trapped-pocket recovery (high priority — before we try to deposit/collect/mine). Another player
+        // clears a rockfall, our nearest-reachable vein pick wanders into the opened pocket, then the rockfall
+        // RESPAWNS and walls us off from the anchor: every subsequent walk (deposit, collect, return) fails to
+        // route and we stall. If our floor's anchor is no longer LOCALLY reachable we're boxed in — mine our way
+        // out through the blocking rockfall. Debounced so a one-loop pathfinder miss can't yank us off a vein.
+        val homeAnchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
+        if (!ctx.walking().canReachToInteract(homeAnchor)) {
+            if (++trappedStreak >= TRAP_CONFIRM) return escapePocket()
+        } else trappedStreak = 0
+
+        // Wash-stall handling. When we hold pay-dirt PENDING in the hopper but the sack hasn't climbed for
+        // DEPOSIT_STUCK_MS, something's wrong. Two cases, checked only when we actually suspect a stall (so the
+        // scene query for struts isn't run every loop):
+        //   1. Both wheel struts broken → the wheel is stopped → fix it ourselves (we carry a hammer). Firing
+        //      BEFORE the wait-for-wash branch stops a deadlock: a stopped wheel never washes.
+        //   2. Otherwise the wheel is fine and our PENDING estimate is just stale (the wash finished and we
+        //      mis-counted, or it washed while we weren't sampling). Clear it — else `spaceLeft` stays wrongly
+        //      small and `waitForWash` waits forever for a wash that isn't coming, which STALLED mining.
+        if (!draining && hopperPending > 0 && lastWashMs != 0L && now - lastWashMs > DEPOSIT_STUCK_MS) {
+            val bothStrutsBroken = repairWheel() && brokenStruts() >= 2
+            if (bothStrutsBroken && haveHammer) return if (onUpperFloor()) descend() else repair()
+            if (now - lastWashMs > WASH_STALE_MS) hopperPending = 0 // stale estimate → trust the real sack level
+        }
 
         return when {
-            // The sack + bank are on the LOWER floor — climb down first if we mined up top.
+            // Power-drop any uncut gems the moment we're not mid-drain (dropping needs the bank closed) — keeps
+            // the inventory clear instead of carrying/banking them.
+            haveGems && !draining -> dropGemsNow()
+            // Whenever we're holding collected ore/nuggets, BANK it — whether mid-drain or a stray load left in
+            // the inventory (e.g. after a reload). The bank is on the LOWER floor, so climb down first if up.
+            // This is what stops 24 coal sitting un-banked while we mine into the last 2 free slots.
+            haveOre && onUpperFloor() -> descend()
+            haveOre -> bankOre()
+            // The sack is on the LOWER floor too — climb down to drain it.
             draining && onUpperFloor() -> descend()
-            draining && haveOre -> bankOre()   // bank each collected load first (frees inventory)
-            // Still holding pay-dirt with room in the sack → deposit it now so the inventory has slots to
-            // collect INTO (a full pay-dirt inventory can't receive any sack ore).
-            draining && payDirt > 0 && spaceLeft > 0 -> deposit()
-            draining -> collect()              // ...and keep collecting until the sack is empty
+            // Still holding pay-dirt with room in the sack, and nothing washing → deposit it now so the inventory
+            // has slots to collect INTO (a full pay-dirt inventory can't receive any sack ore).
+            draining && payDirt > 0 && spaceLeft > 0 && hopperPending == 0 -> deposit()
+            draining -> collect()              // keep collecting until the sack is empty
+            // We WANT to deposit (inventory full, or holding enough to top the sack off) but a previous load is
+            // still washing into the sack — wait for it to clear so our space math is exact and we don't commit
+            // a load on top of unwashed pay-dirt (which overflowed and left some behind after a wheel repair).
+            (full || spaceLeft in 1..payDirt) && payDirt > 0 && hopperPending > 0 -> waitForWash()
             // We hold enough pay-dirt to top the sack off AND it still has room → deposit now (fills it, then
             // drains). A FULL sack (spaceLeft 0) is handled by the drain-enter above, not here — depositing
             // into a full sack is rejected by the game.
@@ -128,24 +190,18 @@ class MotherlodeRoutine(
     // ---- Steps ---------------------------------------------------------------------------------------
 
     private fun mine(): Long = ctx.profiler().section("miner/mlm-mine") {
-        // Debounced: a mining swing dips to idle briefly between hits, so only a SUSTAINED idle means the vein
-        // is done — otherwise we'd hop veins mid-mine.
-        if (loop.stillMining()) { stats.status = "mining"; return@section snap(250, 900) }
         closeStrayBank()?.let { return@section it }
 
-        // Upper level preferred + accessible → climb the ladder up before mining (optional: falls back to the
-        // lower floor if we can't reach the ladder).
-        if (useUpper() && !onUpperFloor()) {
-            val ladder = ladder()
-            if (ladder != null && ladder.distance() <= INTERACT_RANGE) {
-                stats.status = "climbing up"
-                leftOrMenu(ladder, "Climb")
-                return@section snap(1500, 2800)
-            }
-            stats.status = "walking"
-            ctx.webWalking().walkTo(LADDER_TILE)
-            return@section snap(300, 1200)
-        }
+        // Stay on the CURRENT vein until its object is GONE (depleted) — MLM veins yield several pay-dirt before
+        // collapsing, so we switch on the object disappearing, NOT on the idle animation (which dips between
+        // swings and made us hop veins early). While it's still there, keep working it.
+        val current = currentVein?.let { veinAt(it) }
+        if (current != null && current.distance() <= INTERACT_RANGE) return@section mineVein(current)
+        currentVein = null
+
+        // Upper level preferred + accessible → climb the ladder up before picking a vein (optional: falls back
+        // to the lower floor if we can't reach the ladder). Latched so we don't bounce back down.
+        if (useUpper() && !onUpperFloor()) return@section climb("climbing up")
 
         val anchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
         // Right after a bank trip, walk back to the vein cluster ONCE before resuming (one-shot, not a per-loop
@@ -153,54 +209,114 @@ class MotherlodeRoutine(
         val me = ctx.players().localPlayer()?.tile()
         if (returnToAnchor) {
             if (me != null && me.distanceTo(anchor) <= ARRIVE_RADIUS) returnToAnchor = false
-            else { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
+            else { stats.status = "walking"; walkNear(anchor); return@section snap(300, 1200) }
         }
 
-        // STICK with the vein we're already mining until it's depleted — MLM veins yield several pay-dirt
-        // before collapsing, so re-picking the nearest each loop (they're often equidistant) would hop off a
-        // still-productive vein and waste the walk. Only choose a fresh vein once the current one is gone.
-        val vein = currentVein?.let { veinAt(it) } ?: floorVein()
+        // Current vein depleted / gone → pick the nearest REACHABLE vein on our floor and commit to it.
+        val vein = floorVein()
         if (vein != null && vein.distance() <= INTERACT_RANGE) {
             currentVein = vein.tile()
-            stats.status = "mining"
-            leftOrMenu(vein, "Mine")
-            return@section snap(400, 1800)
+            return@section mineVein(vein)
         }
         currentVein = null
         stats.status = "walking"
-        ctx.webWalking().walkTo(anchor)
+        walkNear(anchor)
         snap(300, 1200)
     }
 
-    private fun deposit(): Long = ctx.profiler().section("miner/mlm-deposit") {
+    /** Work [vein]. It is already confirmed LOCALLY reachable — [floorVein] gates every candidate on the local
+     *  scene-collision pathfinder ([Walking.canReachToInteract]), which is rockfall/wall-aware — so we do NOT
+     *  global-walk to it: the global walker can't route through a dynamic rockfall and just stalls (that was the
+     *  "fails to route between mining" bug). Instead we simply CLICK it; the game's built-in walk-to-interact
+     *  paths there and mines. Click ONCE and let OSRS keep mining until it depletes; only re-issue on a SUSTAINED
+     *  idle (debounced), never on the brief dip between swings. */
+    /** Power-drop every uncut gem we're carrying (bank must be closed for a drop to register). */
+    private fun dropGemsNow(): Long = ctx.profiler().section("miner/mlm-drop-gems") {
         closeStrayBank()?.let { return@section it }
-        val anchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
-        val hopper = hopper() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(anchor); return@section snap(300, 1200) }
+        stats.status = "dropping gems"
+        for (gem in UNCUT_GEMS) if (ctx.inventory().count(gem) > 0) ctx.inventory().drop(gem, -1, 90, 230, 5, 400, 900)
+        snap(200, 500)
+    }
+
+    private fun mineVein(vein: SceneEntity): Long {
+        stats.status = "mining"
+        // PRECISE click: geometrically lock onto THIS vein's own clickbox footprint. A plain left-click only
+        // verifies the context menu by NAME ("Mine Ore vein"), so when the vein floorVein confirmed reachable
+        // and a DIFFERENT vein across a wall share the same screen hitbox, it clicks whichever is on top —
+        // often the unreachable one, and we stall trying to path to it. Aiming at our vein's footprint (the
+        // foreground one; the walled-off vein sits behind and higher) targets the reachable one.
+        if (!loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) vein.interactPrecise("Mine")
+        return snap(400, 1000)
+    }
+
+    /** Walled into a pocket (anchor unreachable) → mine the nearest REACHABLE rockfall to reopen the corridor
+     *  out. Rockfalls are ordinary "Mine" objects; clearing the one adjacent to our pocket restores the path. */
+    private fun escapePocket(): Long = ctx.profiler().section("miner/mlm-escape") {
+        closeStrayBank()?.let { return@section it }
+        currentVein = null // abandon whatever pocket vein we were working
+        stats.status = "clearing rockfall"
+        val fall = ctx.objects().query().id(*ROCKFALL).withAction("Mine").within(INTERACT_RANGE).sortNearest().list()
+            .firstOrNull { r ->
+                val t = r.tile() ?: return@firstOrNull false
+                (r.tileHeight() < UPPER_FLOOR_HEIGHT) == onUpperFloor() && ctx.walking().canReachToInteract(t)
+            }
+        if (fall != null) {
+            if (!loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) leftOrMenu(fall, "Mine")
+            return@section snap(400, 1000)
+        }
+        // No rockfall we can stand next to yet — edge locally toward the nearest one until it's in reach.
+        ctx.objects().query().id(*ROCKFALL).withAction("Mine").sortNearest().nearest()?.tile()
+            ?.let { ctx.walking().walkTowards(it); return@section snap(300, 1000) }
+        snap(600, 1500)
+    }
+
+    private fun deposit(): Long = ctx.profiler().section("miner/mlm-deposit") {
+        stats.status = "depositing" // set up-front so the latch-judging loop below doesn't leave a stale status
+        closeStrayBank()?.let { return@section it }
+        // Walk toward the HOPPER's own tile when it's out of scene/range — not the vein anchor, which sits ~17
+        // tiles away (just beyond INTERACT_RANGE) and left us oscillating with a full inventory, never arriving.
+        val hopperTile = if (onUpperFloor()) UPPER_HOPPER_TILE else HOPPER_TILE
+        val hopper = hopper() ?: run { stats.status = "walking"; walkNear(hopperTile); return@section snap(300, 1200) }
         val payDirt = ctx.inventory().count(PAY_DIRT)
-        // A click landed last loop; judge the outcome now: pay-dirt dropped ⇒ it went through (clear the stuck
-        // clock); unchanged ⇒ the deposit was rejected (wheel down) ⇒ start/keep the stuck clock running.
+        // A click landed last loop; judge the outcome now. Pay-dirt dropped ⇒ it went INTO the hopper: count it
+        // as pending wash and (re)start the wheel-down clock from now, so we give the wheel DEPOSIT_STUCK_MS to
+        // wash it before deciding the wheel is stopped. (Note: reaching the hopper does NOT mean it washed — the
+        // sack varbit climbing is the only proof of that, handled in step().)
         if (depositing) {
             depositing = false
-            if (payDirt < payDirtAtDeposit) depositStuckSince = 0L
-            else if (depositStuckSince == 0L) depositStuckSince = System.currentTimeMillis()
+            val deposited = payDirtAtDeposit - payDirt
+            if (deposited > 0) { hopperPending += deposited; lastWashMs = System.currentTimeMillis() }
             return@section snap(250, 700)
         }
-        stats.status = "depositing"
+        approach(hopper, hopperTile)?.let { return@section it }
         payDirtAtDeposit = payDirt
         if (hopper.leftClickIfDefault("Deposit")) depositing = true // the click LANDED → judge the outcome next loop
         snap(500, 1400)
     }
 
+    /** Nothing to do but let the wheel wash the hopper's pending pay-dirt into the sack — a short beat so our
+     *  next deposit's space math is exact (see [hopperPending]). */
+    private fun waitForWash(): Long = ctx.profiler().section("miner/mlm-wash") {
+        stats.status = "washing"
+        snap(700, 1600)
+    }
+
     private fun collect(): Long = ctx.profiler().section("miner/mlm-collect") {
+        stats.status = "collecting" // set up-front so the in-flight early-return below doesn't leave a stale status
         closeStrayBank()?.let { return@section it }
-        val sack = sack() ?: run { stats.status = "walking"; ctx.webWalking().walkTo(SACK_ANCHOR); return@section snap(300, 1200) }
+        val sack = sack() ?: run { stats.status = "walking"; walkNear(SACK_ANCHOR); return@section snap(300, 1200) }
         val sackNow = ctx.varps().varbit(SACK_TRANSMIT)
-        // We already clicked Search and the sack hasn't drained yet → the action is in flight, don't re-click.
-        if (searching && sackNow >= sackAtSearch) return@section snap(250, 700)
+        // We already clicked Search and the sack hasn't drained yet → the action is in flight (walking to it +
+        // extracting), so wait — UNLESS it's been too long (the click missed / never reached the sack), in which
+        // case fall through and retry rather than waiting forever.
+        if (searching && sackNow >= sackAtSearch && System.currentTimeMillis() - searchClickedAt < ACTION_RETRY_MS) {
+            return@section snap(250, 700)
+        }
         searching = false
-        stats.status = "collecting"
+        approach(sack, SACK_ANCHOR)?.let { return@section it } // too far to click → close the gap first
         sackAtSearch = sackNow
-        if (sack.leftClickIfDefault("Search")) searching = true // the click LANDED → latch until the sack drops
+        // Latch on the landed click; if it drains the sack we re-search next load, if it missed we retry after the timeout.
+        if (sack.leftClickIfDefault("Search")) { searching = true; searchClickedAt = System.currentTimeMillis() }
         snap(500, 1300)
     }
 
@@ -219,42 +335,57 @@ class MotherlodeRoutine(
         snap(400, 1000)
     }
 
-    /** Open the sack-side bank chest with a single left-click ("Use" is its default) and WAIT for the bank to
-     *  open — we latch on the landed click so we never re-click the chest once it's already opening/open (which
-     *  is what caused a stray right-click landing inside the open bank UI). openNearest is only a last resort. */
+    /** Open the sack-side bank chest with a single left-click ("Use" is its default). We latch on the landed
+     *  click so we don't re-click a chest that's already opening (a stray click would land inside the open bank
+     *  UI) — but only until [ACTION_RETRY_MS]: if the bank hasn't OPENED by then the click missed, so we clear
+     *  the latch and re-click. ([bankOre] clears [bankOpening] the moment the bank is actually open.) */
     private fun openBank(banking: BankingService): Long {
-        if (bankOpening) return snap(300, 900) // already clicked Use — wait for it, don't click again
+        if (bankOpening) {
+            if (System.currentTimeMillis() - bankClickedAt < ACTION_RETRY_MS) return snap(300, 900) // opening — wait
+            bankOpening = false // didn't open in time → the click missed; fall through and retry
+        }
         val chest = bankChest()
         if (chest != null) {
-            if (chest.leftClickIfDefault("Use")) bankOpening = true
+            approach(chest, BANK_CHEST_TILE)?.let { return it }
+            if (chest.leftClickIfDefault("Use")) { bankOpening = true; bankClickedAt = System.currentTimeMillis() }
             return snap(400, 1000)
         }
         return if (banking.openNearest()) snap(400, 900) else snap(700, 1500)
     }
 
-    /** Climb the ladder DOWN to the lower floor (the sack + bank live there) before draining. */
-    private fun descend(): Long = ctx.profiler().section("miner/mlm-descend") {
-        val ladder = ladder()
-        if (ladder != null && ladder.distance() <= INTERACT_RANGE) {
-            stats.status = "climbing down"
-            leftOrMenu(ladder, "Climb")
-            return@section snap(1500, 2800)
+    /** Climb the ladder DOWN to the lower floor (the sack + bank live there) before draining/repairing. */
+    private fun descend(): Long = ctx.profiler().section("miner/mlm-descend") { climb("climbing down") }
+
+    /** Climb the ladder in whichever direction our floor dictates, LATCHED on the real floor-change signal.
+     *  After issuing a Climb we set [climbing] and wait until [onUpperFloor] flips — we never re-click the ladder
+     *  mid-climb, which is what made it climb straight back up and then miss the strut on the floor below. A
+     *  missed approach (ladder out of range) just walks to it; the latch is only set once a Climb is issued. */
+    private fun climb(status: String): Long {
+        if (climbing) {
+            if (onUpperFloor() != climbFromUpper) { climbing = false; return snap(300, 700) } // floor flipped — done
+            return snap(500, 1100)                                                            // mid-climb — wait
         }
-        stats.status = "walking"
-        ctx.webWalking().walkTo(LADDER_TILE)
-        snap(300, 1200)
+        val ladder = ladder()
+        if (ladder == null || ladder.distance() > CLICK_RANGE) {
+            stats.status = "walking"; walkNear(LADDER_TILE); return snap(300, 1200)
+        }
+        stats.status = status
+        climbFromUpper = onUpperFloor()
+        if (ladder.leftClickIfDefault("Climb")) climbing = true // we issued a Climb — hold until the floor flips
+        return snap(1500, 2800)
     }
 
     private fun repair(): Long = ctx.profiler().section("miner/mlm-repair") {
         closeStrayBank()?.let { return@section it }
         // Already fixed (maybe by another player) → the broken-strut object is gone, so there's nothing to do.
-        val strut = strut() ?: run { depositStuckSince = 0L; return@section snap(400, 900) }
-        depositStuckSince = 0L // we're acting on it — restart the stuck clock; deposits should resume after
+        val strut = strut() ?: run { lastWashMs = System.currentTimeMillis(); return@section snap(400, 900) }
+        strut.tile()?.let { approach(strut, it)?.let { w -> return@section w } }
+        lastWashMs = System.currentTimeMillis() // we're acting on it — give the wheel time to wash before re-judging
         stats.status = "repairing wheel"
         // "Hammer" is the broken strut's DEFAULT action → left-click it. Using leftClickIfDefault (not the
         // right-click menu) means that if it just got fixed, this is a clean no-op instead of a ~10s
         // right-click-retry loop hunting for a "Hammer" option that no longer exists.
-        strut.leftClickIfDefault("Hammer")
+        leftOrMenu(strut, "Hammer")
         snap(800, 2000)
     }
 
@@ -267,12 +398,26 @@ class MotherlodeRoutine(
         return snap(300, 700)
     }
 
-    /** Prefer a plain LEFT-click when [action] is the entity's live default (veins→Mine, hopper→Deposit,
-     *  sack→Search, bank chest→Use all default to their action), falling back to the right-click menu only if
-     *  it genuinely isn't the top entry. Avoids the needless right-click-and-select on every interaction. */
+    /** Left-click [action] when it's the entity's live default, else the right-click menu. */
     private fun leftOrMenu(entity: SceneEntity, action: String) {
         if (!entity.leftClickIfDefault(action)) entity.interact(action)
     }
+
+    /** Walk (LOCALLY) toward [anchor] until [obj] is close enough to click reliably, returning the wait; null
+     *  once in range. The fixed MLM objects (sack/hopper/bank/ladder/strut) are approached from across the room,
+     *  where a click silently no-ops (the clickbox is culled/tiny off-screen) — so close the distance FIRST with
+     *  a local single-scene step (correct for both overlaid floors), then a plain left-click lands. */
+    private fun approach(obj: SceneEntity, anchor: Tile): Long? {
+        if (obj.distance() <= CLICK_RANGE) return null
+        stats.status = "walking"
+        walkNear(anchor)
+        return snap(300, 900)
+    }
+
+    /** Walk (LOCALLY) toward [tile], first resolving to the nearest WALKABLE tile — the fixed MLM objects
+     *  (sack/hopper/bank/ladder) sit on UNwalkable tiles, and a local step to an unwalkable dest just fails
+     *  (that stalled the whole drain). [reachableNear] returns the closest reachable tile to the target. */
+    private fun walkNear(tile: Tile) { ctx.walking().walkStep(ctx.walking().reachableNear(tile)) }
 
     // ---- Scene queries -------------------------------------------------------------------------------
 
@@ -341,12 +486,21 @@ class MotherlodeRoutine(
          *  own Motherlode plugin uses the same threshold). Height < this ⇒ we're on the upper floor. */
         const val UPPER_FLOOR_HEIGHT = -490
 
-        /** Where to mine on the upper floor (by the top of the ladder / upper vein cluster), and the ladder. */
-        val UPPER_ANCHOR = Tile(3755, 5679, 0)
+        /** Where to mine on the upper floor — a real, reachable standing tile inside the upper vein cluster
+         *  (the old (3755,5679) was walled off / not walkable, so the reachability-based trapped check false-
+         *  fired up top). The ladder is the floor's exit. */
+        val UPPER_ANCHOR = Tile(3761, 5668, 0)
         val LADDER_TILE = Tile(3755, 5673, 0)
+
+        /** The two hoppers (one per floor) — walked TO when out of interact range so we always reach one instead
+         *  of stalling near the vein anchor. Verified live (findobj "hopper"). */
+        val BANK_CHEST_TILE = Tile(3761, 5666, 0)   // MLM bank chest (approach tile)
+        val HOPPER_TILE = Tile(3748, 5672, 0)       // lower floor
+        val UPPER_HOPPER_TILE = Tile(3755, 5677, 0) // upper floor
 
         // net.runelite.api.gameval.ObjectID
         val ORE_VEINS = intArrayOf(26661, 26662, 26663, 26664) // MOTHERLODE_ORE_SINGLE/LEFT/MIDDLE/RIGHT
+        val ROCKFALL = intArrayOf(26679, 26680)                 // "Rockfall" ("Mine") — corridor blockers, minable
         const val STRUT_BROKEN = 26670                          // MOTHERLODE_WHEEL_STRUT_BROKEN ("Hammer" action)
         const val HOPPER = 26674                                // MOTHERLODE_HOPPER
         const val SACK = 26688                                  // MOTHERLODE_SACK (searchable)
@@ -359,8 +513,17 @@ class MotherlodeRoutine(
         const val SACK_LARGE = 189
 
         const val INTERACT_RANGE = 15
+        const val CLICK_RANGE = 6 // walk this close to a fixed object before clicking (farther = culled, click no-ops)
+        const val ACTION_RETRY_MS = 3500L // a latched Search/bank-open that hasn't taken effect by now missed → retry
         const val ARRIVE_RADIUS = 5 // "arrived" at the anchor when this close
-        const val DEPOSIT_STUCK_MS = 5000L // deposits blocked this long ⇒ the wheel's down, fix the strut
+        // A vein is mined for several seconds per pay-dirt; the swing animation dips to idle briefly between
+        // swings. Only treat idle THIS long as "actually stopped" (needs a re-click) — shorter than this is a
+        // normal between-swing dip and must NOT re-click, or we spam the same vein.
+        const val VEIN_IDLE_DEBOUNCE_MS = 1800L
+        const val TRAP_CONFIRM = 2 // consecutive "anchor unreachable" reads before we treat ourselves as boxed in
+        const val DEPOSIT_STUCK_MS = 5000L // no wash for this long (both struts broken) ⇒ the wheel's down, fix it
+        const val WASH_STALE_MS = 9000L    // no wash this long + wheel NOT down ⇒ pending estimate is stale, clear it
+        const val SACK_RESERVE = 1 // treat the sack full 1 early so a whole deposited load always fits
         const val INV_SLOTS = 28 // a full inventory (items() returns filled slots)
 
         const val PAY_DIRT = "Pay-dirt"
