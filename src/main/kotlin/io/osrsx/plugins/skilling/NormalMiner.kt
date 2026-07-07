@@ -58,7 +58,8 @@ class NormalMiner(
         val rock = ctx.objects().query().named(rockName()).withAction("Mine").nearest()
         if (rock != null && rock.distance() <= INTERACT_RANGE && loop.canReach(rock)) {
             stats.status = "mining"
-            rock.interact("Mine")
+            // Prefer a plain left-click when "Mine" is the rock's default, else fall back to the menu.
+            if (!rock.leftClickIfDefault("Mine")) rock.interact("Mine")
             return@section snap(400, 1800)
         }
         stats.status = "waiting" // rocks respawning
