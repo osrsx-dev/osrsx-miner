@@ -103,7 +103,7 @@ class MotherlodeRoutine(
 
     /** What [senseMlm] pre-decided this tick: the early-exit branches (gear/escape/repair) as a discriminant,
      *  else [NORMAL] with the pay-dirt-cycle values the domain steps dispatch on. */
-    private enum class Act { GEAR, ESCAPE, REPAIR, DESCEND_REPAIR, NORMAL }
+    private enum class Act { GEAR, TRAVEL, ESCAPE, REPAIR, DESCEND_REPAIR, NORMAL }
 
     /** ONE coherent snapshot per tick — the sack/drain state machine advanced + the old `when`-ladder inputs,
      *  so every step sees the same view (see [io.osrsx.plugin.Routine]). Fields shadow the routine's like-named
@@ -133,6 +133,9 @@ class MotherlodeRoutine(
     ) {
         onStop { clearMark() }
         step("gearing up", { act == Act.GEAR }) { gear!! }
+        // The ONLY global-walker use in the MLM routine: get us to the mine initially. All in-mine navigation
+        // (return-to-cluster, sack, hopper, ladders) stays local — see the routine's action methods.
+        step("travelling", { act == Act.TRAVEL }) { ctx.webWalking().walkTo(ANCHOR); snap(300, 1100) }
         step("escaping", { act == Act.ESCAPE }) { escapePocket() }
         step("repairing", { act == Act.REPAIR }) { repair() }
         step("descending", { act == Act.DESCEND_REPAIR }) { descend() }
@@ -206,6 +209,12 @@ class MotherlodeRoutine(
             if (sackNow > 0) emptyStreak = 0 else if (collectedAny && !haveOre) emptyStreak++
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
+
+        // Not in the mine yet (logged in elsewhere, or walked out) → web-walk IN before anything else, so the
+        // trapped-pocket recovery below (which mines through a rockfall) can't mis-fire on a merely-distant
+        // anchor. This is the ONLY global-walker leg; everything in-mine below stays local.
+        val me = ctx.players().localPlayer()?.tile()
+        if (me == null || me.distanceTo(ANCHOR) > MINE_ENTRY_RADIUS) return Snap(Act.TRAVEL)
 
         // Trapped-pocket recovery (high priority — before we try to deposit/collect/mine). Another player
         // clears a rockfall, our nearest-reachable vein pick wanders into the opened pocket, then the rockfall
@@ -652,6 +661,9 @@ class MotherlodeRoutine(
         const val CLICK_RANGE = 6 // walk this close to a fixed object before clicking (farther = culled, click no-ops)
         const val ACTION_RETRY_MS = 3500L // a latched Search/bank-open that hasn't taken effect by now missed → retry
         const val ARRIVE_RADIUS = 5 // "arrived" at the anchor when this close
+        // Beyond this from the anchor we're not in the mine at all → web-walk IN. Larger than the whole cavern
+        // (both floors sit well within ~50 tiles of ANCHOR), so in-mine navigation never trips it.
+        const val MINE_ENTRY_RADIUS = 80
         // A vein is mined for several seconds per pay-dirt; the swing animation dips to idle briefly between
         // swings. Only treat idle THIS long as "actually stopped" (needs a re-click) — shorter than this is a
         // normal between-swing dip and must NOT re-click, or we spam the same vein.
