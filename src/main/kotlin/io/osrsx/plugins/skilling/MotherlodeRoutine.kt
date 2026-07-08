@@ -11,6 +11,8 @@ import io.osrsx.api.Tile
 import io.osrsx.api.facingTile
 import io.osrsx.api.get
 import io.osrsx.api.section
+import io.osrsx.plugin.Routine
+import io.osrsx.plugin.routine
 import java.awt.Color
 
 /**
@@ -37,7 +39,7 @@ class MotherlodeRoutine(
     lockInput: () -> Boolean,
     stopReason: () -> String?,
 ) {
-    private val loop = MinerLoop(ctx, lockInput, stopReason) { step() }
+    private val gate = IdleGate(ctx)
 
     /** True while emptying a full sack — set once the sack is full, cleared once it's empty. */
     private var draining = false
@@ -101,8 +103,55 @@ class MotherlodeRoutine(
     private var targetHl: Highlight? = null
     private var targetHlKey: String? = null
 
-    fun tick(): Long = loop.tick()
-    fun releaseInput() { loop.releaseInput(); clearMark() }
+    /** Cleanup the plugin calls on stop — release the target highlight (input is released by the plugin). */
+    fun onStopped() { clearMark() }
+
+    /** What [senseMlm] pre-decided this tick: the early-exit branches (gear/escape/repair) as a discriminant,
+     *  else [NORMAL] with the pay-dirt-cycle values the domain steps dispatch on. */
+    private enum class Act { GEAR, ESCAPE, REPAIR, DESCEND_REPAIR, NORMAL }
+
+    /** ONE coherent snapshot per tick — the sack/drain state machine advanced + the old `when`-ladder inputs,
+     *  so every step sees the same view (see [io.osrsx.plugin.Routine]). Fields shadow the routine's like-named
+     *  state deliberately: a step reads the value sensed at tick start, not a mid-tick mutation. */
+    private data class Snap(
+        val act: Act,
+        val gear: Long? = null,
+        val haveGems: Boolean = false,
+        val haveOre: Boolean = false,
+        val onUpper: Boolean = false,
+        val draining: Boolean = false,
+        val payDirt: Int = 0,
+        val spaceLeft: Int = 0,
+        val hopperPending: Int = 0,
+        val full: Boolean = false,
+    )
+
+    /** The Motherlode decision ladder. [minerPrologue] guards run first; then — because the pay-dirt cycle is a
+     *  compute-state-then-dispatch machine, not independent rules — [senseMlm] senses one snapshot (advancing
+     *  the sack/drain state + pre-deciding the early exits) and these steps dispatch on it. A
+     *  [io.osrsx.plugin.RoutinePlugin] drives it. */
+    val routine: Routine<*> = routine<Snap>(
+        profiler = ctx.profiler(),
+        spanPrefix = "miner",
+        status = { stats.status = it },
+        sense = ::senseMlm,
+    ) {
+        minerPrologue(ctx, lockInput, stopReason)
+        step("gearing up", { act == Act.GEAR }) { gear!! }
+        step("escaping", { act == Act.ESCAPE }) { escapePocket() }
+        step("repairing", { act == Act.REPAIR }) { repair() }
+        step("descending", { act == Act.DESCEND_REPAIR }) { descend() }
+        step("dropping gems", { act == Act.NORMAL && haveGems && !draining }) { dropGemsNow() }
+        step("descending", { act == Act.NORMAL && haveOre && onUpper }) { descend() }
+        step("banking", { act == Act.NORMAL && haveOre }) { bankOre() }
+        step("descending", { act == Act.NORMAL && draining && onUpper }) { descend() }
+        step("depositing", { act == Act.NORMAL && draining && payDirt > 0 && spaceLeft > 0 && hopperPending == 0 }) { deposit() }
+        step("collecting", { act == Act.NORMAL && draining }) { collect() }
+        step("waiting for wash", { act == Act.NORMAL && (full || spaceLeft in 1..payDirt) && payDirt > 0 && hopperPending > 0 }) { waitForWash() }
+        step("depositing", { act == Act.NORMAL && payDirt > 0 && spaceLeft in 1..payDirt }) { toppedOff = true; deposit() }
+        step("depositing", { act == Act.NORMAL && full && payDirt > 0 }) { deposit() }
+        step("mining", { act == Act.NORMAL }) { mine() }
+    }
 
     /** Outline [entity] as the CURRENT target, colour-coded per action, reusing one handle so highlights never
      *  stack. Passing null (or with the option off) clears it. The highlight tracks the entity as it moves. */
@@ -117,12 +166,11 @@ class MotherlodeRoutine(
 
     private fun clearMark() { targetHl?.remove(); targetHl = null; targetHlKey = null }
 
-    private fun step(): Long {
+    private fun senseMlm(): Snap {
         // Gearing is BLOCKED during a sack→bank drain: depositAll can bank a non-wielded pickaxe, and re-gearing
         // it mid-drain would stall the collect cycle at the bank. We re-gear only once the sack is empty.
         if (!draining) {
-            stats.status = "gearing up"
-            gearUp()?.let { return it }
+            gearUp()?.let { return Snap(Act.GEAR, gear = it) }
         }
 
         // ONE inventory snapshot per loop — scan it locally rather than a contains()/count() per item (each of
@@ -171,7 +219,7 @@ class MotherlodeRoutine(
         // out through the blocking rockfall. Debounced so a one-loop pathfinder miss can't yank us off a vein.
         val homeAnchor = if (onUpperFloor()) UPPER_ANCHOR else ANCHOR
         if (!ctx.walking().canReachToInteract(homeAnchor)) {
-            if (++trappedStreak >= TRAP_CONFIRM) return escapePocket()
+            if (++trappedStreak >= TRAP_CONFIRM) return Snap(Act.ESCAPE)
         } else trappedStreak = 0
 
         // Wash-stall handling. When we hold pay-dirt PENDING in the hopper but the sack hasn't climbed for
@@ -184,37 +232,23 @@ class MotherlodeRoutine(
         //      small and `waitForWash` waits forever for a wash that isn't coming, which STALLED mining.
         if (!draining && hopperPending > 0 && lastWashMs != 0L && now - lastWashMs > DEPOSIT_STUCK_MS) {
             val bothStrutsBroken = repairWheel() && brokenStruts() >= 2
-            if (bothStrutsBroken && haveHammer) return if (onUpperFloor()) descend() else repair()
+            if (bothStrutsBroken && haveHammer) return Snap(if (onUpperFloor()) Act.DESCEND_REPAIR else Act.REPAIR)
             if (now - lastWashMs > WASH_STALE_MS) hopperPending = 0 // stale estimate → trust the real sack level
         }
 
-        return when {
-            // Power-drop any uncut gems the moment we're not mid-drain (dropping needs the bank closed) — keeps
-            // the inventory clear instead of carrying/banking them.
-            haveGems && !draining -> dropGemsNow()
-            // Whenever we're holding collected ore/nuggets, BANK it — whether mid-drain or a stray load left in
-            // the inventory (e.g. after a reload). The bank is on the LOWER floor, so climb down first if up.
-            // This is what stops 24 coal sitting un-banked while we mine into the last 2 free slots.
-            haveOre && onUpperFloor() -> descend()
-            haveOre -> bankOre()
-            // The sack is on the LOWER floor too — climb down to drain it.
-            draining && onUpperFloor() -> descend()
-            // Still holding pay-dirt with room in the sack, and nothing washing → deposit it now so the inventory
-            // has slots to collect INTO (a full pay-dirt inventory can't receive any sack ore).
-            draining && payDirt > 0 && spaceLeft > 0 && hopperPending == 0 -> deposit()
-            draining -> collect()              // keep collecting until the sack is empty
-            // We WANT to deposit (inventory full, or holding enough to top the sack off) but a previous load is
-            // still washing into the sack — wait for it to clear so our space math is exact and we don't commit
-            // a load on top of unwashed pay-dirt (which overflowed and left some behind after a wheel repair).
-            (full || spaceLeft in 1..payDirt) && payDirt > 0 && hopperPending > 0 -> waitForWash()
-            // We hold enough pay-dirt to top the sack off AND it still has room → deposit now (fills it, then
-            // drains). A FULL sack (spaceLeft 0) is handled by the drain-enter above, not here — depositing
-            // into a full sack is rejected by the game.
-            payDirt > 0 && spaceLeft in 1..payDirt -> { toppedOff = true; deposit() }
-            // Otherwise deposit a full load whenever the inventory fills.
-            full && payDirt > 0 -> deposit()
-            else -> mine()
-        }
+        // Everything above matches the old `step()` exactly; the `when` that dispatched here is now the domain
+        // step list in `routine`, keyed off this snapshot. The step comments live there.
+        return Snap(
+            act = Act.NORMAL,
+            haveGems = haveGems,
+            haveOre = haveOre,
+            onUpper = onUpperFloor(),
+            draining = draining,
+            payDirt = payDirt,
+            spaceLeft = spaceLeft,
+            hopperPending = hopperPending,
+            full = full,
+        )
     }
 
     // ---- Steps ---------------------------------------------------------------------------------------
@@ -227,7 +261,7 @@ class MotherlodeRoutine(
         // dead tile and standing still. Drop it so the pick below re-selects a fresh, live vein. Walking or
         // animating resets the streak, so normal mining/travel never trips this.
         val moving = ctx.players().localPlayer()?.isMoving ?: false
-        idleStreak = if (!loop.isAnimating() && !moving) idleStreak + 1 else 0
+        idleStreak = if (!gate.isAnimating() && !moving) idleStreak + 1 else 0
         if (idleStreak >= STUCK_LOOPS) { idleStreak = 0; currentVein = null; clearMark() }
 
         // Stay on the CURRENT vein until its object is GONE (depleted) — MLM veins yield several pay-dirt before
@@ -238,7 +272,7 @@ class MotherlodeRoutine(
             // CONFIRM against reality: once we're actually mining (animating), track + highlight the vein we're
             // truly standing beside — a click can land on an overlapping neighbour, so the planned tile isn't a
             // guarantee. [workedVein] is the minable vein orthogonally adjacent to us (null → keep the plan).
-            val actual = if (loop.isAnimating()) (workedVein() ?: current) else current
+            val actual = if (gate.isAnimating()) (workedVein() ?: current) else current
             currentVein = actual.tile()
             return@section mineVein(actual)
         }
@@ -286,7 +320,7 @@ class MotherlodeRoutine(
     private fun mineVein(vein: SceneEntity): Long {
         mark(vein, Color.GREEN, "Mine")
         stats.status = "mining"
-        if (loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) return snap(400, 1000) // already mining — don't re-issue
+        if (gate.stillBusy(VEIN_IDLE_DEBOUNCE_MS)) return snap(400, 1000) // already mining — don't re-issue
 
         // VERIFY the cursor is over OUR vein before committing. A plain left-click only checks the menu by NAME
         // ("Mine Ore vein"), and even a precise click can land on a DIFFERENT vein that shares this one's screen
@@ -318,7 +352,7 @@ class MotherlodeRoutine(
             }
         if (fall != null) {
             mark(fall, Color.RED, "Clear rockfall")
-            if (!loop.stillMining(VEIN_IDLE_DEBOUNCE_MS)) leftOrMenu(fall, "Mine")
+            if (!gate.stillBusy(VEIN_IDLE_DEBOUNCE_MS)) leftOrMenu(fall, "Mine")
             return@section snap(400, 1000)
         }
         // No rockfall we can stand next to yet — edge locally toward the nearest one until it's in reach.

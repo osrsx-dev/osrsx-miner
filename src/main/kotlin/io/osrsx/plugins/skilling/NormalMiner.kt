@@ -5,6 +5,8 @@ import io.osrsx.api.ItemRef
 import io.osrsx.api.PluginContext
 import io.osrsx.api.get
 import io.osrsx.api.section
+import io.osrsx.plugin.Routine
+import io.osrsx.plugin.routine
 
 /**
  * The routine for the ordinary rock ores (copper/tin/iron/coal): web-walk to the chosen catalogued [MineSite]
@@ -27,20 +29,38 @@ class NormalMiner(
     lockInput: () -> Boolean,
     stopReason: () -> String?,
 ) {
-    private val loop = MinerLoop(ctx, lockInput, stopReason) { step() }
+    /**
+     * One coherent read per tick, shared by every step (see [io.osrsx.plugin.Routine]). [gear] is the
+     * gear-up delay when the pickaxe still needs sorting — sensed FIRST (before any inventory read), exactly
+     * as the old top-of-loop `gearUp()?.let { return it }` did, so a gearing tick never touches the inventory.
+     */
+    private data class Snap(val gear: Long?, val invNames: List<String>, val full: Boolean)
 
-    fun tick(): Long = loop.tick()
-    fun releaseInput() = loop.releaseInput()
+    private val gate = IdleGate(ctx)
 
-    private fun step(): Long {
-        stats.status = "gearing up"
-        gearUp()?.let { return it }
-        if (dropGems() && hasUncutGem(ctx.inventory().items().mapNotNull { it.name })) return dropGemsNow()
-        return when {
-            !ctx.inventory().isFull() -> mine()
-            bank() -> bankOre()
-            else -> dropOre()
-        }
+    /** The decision ladder: the shared [minerPrologue] guards (login/yield/stop/break/dialogue/idle) run first,
+     *  then this priority list of named steps — the first whose guard holds runs, and the [io.osrsx.plugin.Routine]
+     *  labels the status + times the step under `miner/<name>`. A [io.osrsx.plugin.RoutinePlugin] drives it. */
+    val routine: Routine<*> = routine<Snap>(
+        profiler = ctx.profiler(),
+        spanPrefix = "miner",
+        status = { stats.status = it },
+        sense = {
+            val gear = gearUp()
+            if (gear != null) {
+                Snap(gear, emptyList(), false)
+            } else {
+                val names = ctx.inventory().items().mapNotNull { it.name }
+                Snap(null, names, ctx.inventory().isFull())
+            }
+        },
+    ) {
+        minerPrologue(ctx, lockInput, stopReason)
+        step("gearing up", { gear != null }) { gear!! }
+        step("dropping gems", { dropGems() && hasUncutGem(invNames) }) { dropGemsNow() }
+        step("mining", { !full }) { mine() }
+        step("banking", { bank() }) { bankOre() }
+        step("dropping", { true }) { dropOre() }
     }
 
     /** Power-drop every uncut gem we're carrying. */
@@ -53,7 +73,7 @@ class NormalMiner(
     private fun mine(): Long = ctx.profiler().section("miner/mine") {
         // Debounced idle: a mining swing dips to idle between hits, so only a sustained idle means the rock's
         // depleted (avoids re-clicking / hopping rocks mid-mine).
-        if (loop.stillMining()) { stats.status = "mining"; return@section snap(250, 900) }
+        if (gate.stillBusy()) { stats.status = "mining"; return@section snap(250, 900) }
 
         val target = site() ?: run { stats.status = "no location"; return@section snap(1200, 2500) }
 
@@ -67,7 +87,7 @@ class NormalMiner(
 
         // At the site → mine the nearest reachable, close-enough rock.
         val rock = ctx.objects().query().named(rockName()).withAction("Mine").nearest()
-        if (rock != null && rock.distance() <= INTERACT_RANGE && loop.canReach(rock)) {
+        if (rock != null && rock.distance() <= INTERACT_RANGE && ctx.canReach(rock)) {
             stats.status = "mining"
             // Prefer a plain left-click when "Mine" is the rock's default, else fall back to the menu.
             if (!rock.leftClickIfDefault("Mine")) rock.interact("Mine")
