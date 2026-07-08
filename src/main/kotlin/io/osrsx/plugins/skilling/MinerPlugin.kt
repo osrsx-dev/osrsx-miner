@@ -7,8 +7,8 @@ import io.osrsx.config.eq
 import io.osrsx.config.isFalse
 import io.osrsx.config.notEq
 import io.osrsx.plugin.HasOverlay
-import io.osrsx.plugin.Plugin
 import io.osrsx.plugin.PluginDescriptor
+import io.osrsx.plugin.RoutinePlugin
 import io.osrsx.plugin.ScriptGui
 
 /**
@@ -28,7 +28,7 @@ import io.osrsx.plugin.ScriptGui
     author = "osrsx",
     tags = ["skilling", "mining", "gathering"],
 )
-class MinerPlugin : Plugin(), HasOverlay {
+class MinerPlugin : RoutinePlugin(), HasOverlay {
 
     object Config : PluginConfig("miner") {
         private const val MLM = "Motherlode"
@@ -151,13 +151,13 @@ class MinerPlugin : Plugin(), HasOverlay {
         if (key == "ore") Config.location = MineSites.BEST
     }
 
-    override fun onStop() {
-        normal.releaseInput()
-        motherlode.releaseInput()
-    }
+    override fun routine() = if (Config.isMotherlode) motherlode.routine else normal.routine
 
-    override fun onLoop(): Long =
-        if (Config.isMotherlode) motherlode.tick() else normal.tick()
+    override fun onStop() {
+        super.onStop()
+        if (ctx.input().isLocked()) ctx.input().unlock()
+        motherlode.onStopped()
+    }
 
     override fun overlayTitle() = "Mining"
 
