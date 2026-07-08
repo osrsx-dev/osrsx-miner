@@ -36,8 +36,6 @@ class MotherlodeRoutine(
     private val dropGems: () -> Boolean,
     private val highlight: () -> Boolean,
     private val stats: MinerStats,
-    lockInput: () -> Boolean,
-    stopReason: () -> String?,
 ) {
     private val gate = IdleGate(ctx)
 
@@ -103,9 +101,6 @@ class MotherlodeRoutine(
     private var targetHl: Highlight? = null
     private var targetHlKey: String? = null
 
-    /** Cleanup the plugin calls on stop — release the target highlight (input is released by the plugin). */
-    fun onStopped() { clearMark() }
-
     /** What [senseMlm] pre-decided this tick: the early-exit branches (gear/escape/repair) as a discriminant,
      *  else [NORMAL] with the pay-dirt-cycle values the domain steps dispatch on. */
     private enum class Act { GEAR, ESCAPE, REPAIR, DESCEND_REPAIR, NORMAL }
@@ -136,7 +131,7 @@ class MotherlodeRoutine(
         status = { stats.status = it },
         sense = ::senseMlm,
     ) {
-        minerPrologue(ctx, lockInput, stopReason)
+        onStop { clearMark() }
         step("gearing up", { act == Act.GEAR }) { gear!! }
         step("escaping", { act == Act.ESCAPE }) { escapePocket() }
         step("repairing", { act == Act.REPAIR }) { repair() }
