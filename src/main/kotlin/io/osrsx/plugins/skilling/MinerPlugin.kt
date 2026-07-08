@@ -9,6 +9,7 @@ import io.osrsx.config.notEq
 import io.osrsx.plugin.HasOverlay
 import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.RoutinePlugin
+import io.osrsx.plugin.routine
 import io.osrsx.plugin.ScriptGui
 
 /**
@@ -120,8 +121,6 @@ class MinerPlugin : RoutinePlugin(), HasOverlay {
             dropPace = { Config.minDrop to Config.maxDrop },
             dropGems = { Config.dropGems },
             stats = stats,
-            lockInput = { Config.lockInput },
-            stopReason = { stops.reason() },
         )
     }
 
@@ -134,29 +133,35 @@ class MinerPlugin : RoutinePlugin(), HasOverlay {
             dropGems = { Config.dropGems },
             highlight = { Config.highlightObjects },
             stats = stats,
-            lockInput = { Config.lockInput },
-            stopReason = { stops.reason() },
         )
     }
 
-    override fun onStart() {
-        stats.start()
-        stats.carried = {
-            if (Config.isMotherlode) inventory.count("Pay-dirt") else inventory.count(currentOreName())
+    /**
+     * The plugin's single **core** routine — the whole loop. It owns the shared prologue (login/yield/stop/
+     * break/dialogue/idle guards + input-lock/run upkeep via [minerPrologue]), its own start/stop lifecycle
+     * (stats init; input release), and delegates each tick to the normal or Motherlode sub-routine. The
+     * [RoutinePlugin] base drives start/loop/stop — there is deliberately no onLoop/onStart/onStop here.
+     */
+    private val core by lazy {
+        routine(ctx.profiler(), "miner", status = { stats.status = it }) {
+            minerPrologue(ctx, { Config.lockInput }, { stops.reason() })
+            onStart {
+                stats.start()
+                stats.carried = {
+                    if (Config.isMotherlode) inventory.count("Pay-dirt") else inventory.count(currentOreName())
+                }
+            }
+            onStop { if (ctx.input().isLocked()) ctx.input().unlock() }
+            subroutine("motherlode", { Config.isMotherlode }, motherlode.routine)
+            subroutine("normal", { true }, normal.routine)
         }
     }
+
+    override fun routine() = core
 
     /** Reset the location to "Auto — select best" when the ore changes — a label for the old ore is invalid. */
     override fun onConfigChanged(key: String) {
         if (key == "ore") Config.location = MineSites.BEST
-    }
-
-    override fun routine() = if (Config.isMotherlode) motherlode.routine else normal.routine
-
-    override fun onStop() {
-        super.onStop()
-        if (ctx.input().isLocked()) ctx.input().unlock()
-        motherlode.onStopped()
     }
 
     override fun overlayTitle() = "Mining"

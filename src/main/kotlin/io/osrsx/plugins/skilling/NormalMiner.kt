@@ -26,8 +26,6 @@ class NormalMiner(
     private val dropPace: () -> Pair<Int, Int>,
     private val dropGems: () -> Boolean,
     private val stats: MinerStats,
-    lockInput: () -> Boolean,
-    stopReason: () -> String?,
 ) {
     /**
      * One coherent read per tick, shared by every step (see [io.osrsx.plugin.Routine]). [gear] is the
@@ -38,9 +36,9 @@ class NormalMiner(
 
     private val gate = IdleGate(ctx)
 
-    /** The decision ladder: the shared [minerPrologue] guards (login/yield/stop/break/dialogue/idle) run first,
-     *  then this priority list of named steps — the first whose guard holds runs, and the [io.osrsx.plugin.Routine]
-     *  labels the status + times the step under `miner/<name>`. A [io.osrsx.plugin.RoutinePlugin] drives it. */
+    /** The normal-ore decision ladder — a guard-less domain [io.osrsx.plugin.Routine] nested under the plugin's
+     *  core routine (which owns the login/break/idle prologue). Priority list of named steps: the first whose
+     *  guard holds runs, and the Routine labels the status + times it under `miner/<name>`. */
     val routine: Routine<*> = routine<Snap>(
         profiler = ctx.profiler(),
         spanPrefix = "miner",
@@ -55,7 +53,6 @@ class NormalMiner(
             }
         },
     ) {
-        minerPrologue(ctx, lockInput, stopReason)
         step("gearing up", { gear != null }) { gear!! }
         step("dropping gems", { dropGems() && hasUncutGem(invNames) }) { dropGemsNow() }
         step("mining", { !full }) { mine() }
