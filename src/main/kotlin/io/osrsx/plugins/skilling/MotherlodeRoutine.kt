@@ -53,6 +53,11 @@ class MotherlodeRoutine(
     /** After finishing a drain (at the bank), walk back to the vein cluster ONCE before mining again. */
     private var returnToAnchor = false
 
+    /** Latched true once we've stood EXACTLY on [ANCHOR] (arrived in the main area, past the entrance
+     *  rockfalls the web-walker cleared). Until then we only TRAVEL; no MLM-specific logic runs. Re-armed to
+     *  false only if we later end up past [MINE_ENTRY_RADIUS] from the anchor (genuinely left the mine). */
+    private var atMine = false
+
     /** The vein tile we're currently working — kept until it depletes so we don't hop veins mid-mine. */
     private var currentVein: Tile? = null
 
@@ -119,6 +124,7 @@ class MotherlodeRoutine(
         val spaceLeft: Int = 0,
         val hopperPending: Int = 0,
         val full: Boolean = false,
+        val canDeclutter: Boolean = false,
     )
 
     /** The Motherlode decision ladder. [minerPrologue] guards run first; then — because the pay-dirt cycle is a
@@ -139,6 +145,9 @@ class MotherlodeRoutine(
         step("escaping", { act == Act.ESCAPE }) { escapePocket() }
         step("repairing", { act == Act.REPAIR }) { repair() }
         step("descending", { act == Act.DESCEND_REPAIR }) { descend() }
+        // Bank the trip's leftovers (transport item, displaced graceful) before mining — gated so we hold no
+        // pay-dirt/ore/gems, so it can never bank the good stuff. Fires once at startup, then never again.
+        step("depositing junk", { act == Act.NORMAL && canDeclutter }) { declutter() }
         step("dropping gems", { act == Act.NORMAL && haveGems && !draining }) { dropGemsNow() }
         step("descending", { act == Act.NORMAL && haveOre && onUpper }) { descend() }
         step("banking", { act == Act.NORMAL && haveOre }) { bankOre() }
@@ -169,6 +178,18 @@ class MotherlodeRoutine(
         // it mid-drain would stall the collect cycle at the bank. We re-gear only once the sack is empty.
         if (!draining) {
             gearUp()?.let { return Snap(Act.GEAR, gear = it) }
+        }
+
+        // Travel to the mine anchor FIRST, and stay in TRAVEL until we're standing EXACTLY on it. The
+        // web-walker mines through the entrance rockfalls itself (they're `take[rockfall (Mine)]` transports on
+        // the route to ANCHOR) — that is NOT our MLM rockfall management, which must stay OFF until we're there.
+        // Latch on arrival so mining movement never sends us back out; only genuinely leaving the mine (back
+        // past MINE_ENTRY_RADIUS) re-arms travel. Nothing below — the sack state machine, trapped-pocket
+        // recovery, mining — runs until we're standing on the anchor.
+        val me = ctx.players().localPlayer()?.tile()
+        if (me == null || me.distanceTo(ANCHOR) > MINE_ENTRY_RADIUS) atMine = false
+        if (!atMine) {
+            if (me != null && me.distanceTo(ANCHOR) == 0) atMine = true else return Snap(Act.TRAVEL)
         }
 
         // ONE inventory snapshot per loop — scan it locally rather than a contains()/count() per item (each of
@@ -210,12 +231,6 @@ class MotherlodeRoutine(
             if (emptyStreak >= 2) { draining = false; collectedAny = false; emptyStreak = 0; returnToAnchor = true }
         }
 
-        // Not in the mine yet (logged in elsewhere, or walked out) → web-walk IN before anything else, so the
-        // trapped-pocket recovery below (which mines through a rockfall) can't mis-fire on a merely-distant
-        // anchor. This is the ONLY global-walker leg; everything in-mine below stays local.
-        val me = ctx.players().localPlayer()?.tile()
-        if (me == null || me.distanceTo(ANCHOR) > MINE_ENTRY_RADIUS) return Snap(Act.TRAVEL)
-
         // Trapped-pocket recovery (high priority — before we try to deposit/collect/mine). Another player
         // clears a rockfall, our nearest-reachable vein pick wanders into the opened pocket, then the rockfall
         // RESPAWNS and walls us off from the anchor: every subsequent walk (deposit, collect, return) fails to
@@ -240,6 +255,13 @@ class MotherlodeRoutine(
             if (now - lastWashMs > WASH_STALE_MS) hopperPending = 0 // stale estimate → trust the real sack level
         }
 
+        // Startup clean-up flag: we've arrived with no pay-dirt/ore/gems held, but the trip left FOREIGN items
+        // in the inventory — a transport item the web-walker used, graceful pieces the prospector swap
+        // displaced — anything that isn't a tool. Guarded by the empty-of-valuables state so decluttering can
+        // never bank pay-dirt/ore/gems, and it won't fire once mining is under way.
+        val canDeclutter = !draining && payDirt == 0 && !haveOre && !hasUncutGem(names) &&
+            names.any { it != "Hammer" && it != "Imcando hammer" && !it.contains("pickaxe", ignoreCase = true) }
+
         // Everything above matches the old `step()` exactly; the `when` that dispatched here is now the domain
         // step list in `routine`, keyed off this snapshot. The step comments live there.
         return Snap(
@@ -252,6 +274,7 @@ class MotherlodeRoutine(
             spaceLeft = spaceLeft,
             hopperPending = hopperPending,
             full = full,
+            canDeclutter = canDeclutter,
         )
     }
 
@@ -441,6 +464,28 @@ class MotherlodeRoutine(
         }
         banking.close()
         stats.addProduced((before - countAll(MLM_ORES)).coerceAtLeast(0))
+        snap(400, 1000)
+    }
+
+    /** One-time startup clean-up: bank whatever the trip left in the inventory that isn't a tool — a transport
+     *  item the web-walker used to get here, graceful pieces the prospector swap displaced. Keeps the hammer
+     *  (wheel repairs) and any pickaxe (normally wielded, so not here — kept by name if it is). Guarded by
+     *  [Snap.canDeclutter] so it only runs before mining and can never bank pay-dirt / ore / gems. Reuses
+     *  [openBank] to walk to + open the sack-side chest. */
+    private fun declutter(): Long = ctx.profiler().section("miner/mlm-declutter") {
+        val banking = ctx.services().get<BankingService>() ?: return@section snap(700, 1600)
+        stats.status = "banking junk"
+        if (!banking.isOpen()) return@section openBank(banking)
+        val keep = buildList {
+            add(ItemRef.ByName("Hammer"))
+            add(ItemRef.ByName("Imcando hammer"))
+            ctx.inventory().items().mapNotNull { it.name }
+                .filter { it.contains("pickaxe", ignoreCase = true) }
+                .distinct()
+                .forEach { add(ItemRef.ByName(it)) }
+        }
+        banking.depositAllExcept(*keep.toTypedArray())
+        banking.close()
         snap(400, 1000)
     }
 
