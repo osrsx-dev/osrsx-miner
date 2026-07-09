@@ -1,11 +1,11 @@
 package io.osrsx.plugins.skilling
 
 import io.osrsx.api.profile
-import io.osrsx.plugin.HasOverlay
+import io.osrsx.plugin.Gfx2D
+import io.osrsx.plugin.HasPanel
 import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.RoutinePlugin
 import io.osrsx.plugin.routine
-import io.osrsx.plugin.ScriptGui
 
 /**
  * Location-aware mining plugin. Pick an **ore** (Copper/Tin/Iron/Coal/Motherlode) and a **location**; the
@@ -24,7 +24,7 @@ import io.osrsx.plugin.ScriptGui
     author = "osrsx",
     tags = ["skilling", "mining", "gathering"],
 )
-class MinerPlugin : RoutinePlugin(), HasOverlay {
+class MinerPlugin : RoutinePlugin(), HasPanel {
 
     override fun config() = Config
 
@@ -107,9 +107,7 @@ class MinerPlugin : RoutinePlugin(), HasOverlay {
         if (key == "ore") Config.location = MineSites.BEST
     }
 
-    override fun overlayTitle() = "Mining"
-
-    override fun onOverlay(gui: ScriptGui) = profile("miner/overlay") {
+    override fun onPanel(gfx: Gfx2D) = profile("miner/overlay") {
         val target = if (Config.isMotherlode) "Motherlode" else "${currentOre().display} — ${Config.location}"
         val rows = if (Config.isMotherlode) {
             listOf("Target" to target, "Ore banked" to MinerOverlay.commas(stats.output()))
@@ -121,6 +119,6 @@ class MinerPlugin : RoutinePlugin(), HasOverlay {
                     to "${MinerOverlay.commas(stats.output())} (${MinerOverlay.compact(stats.perHour(worth))} gp/hr)",
             )
         }
-        MinerOverlay.render(gui, stats, rows)
+        gfx.overlay("Mining") { g -> MinerOverlay.render(g, stats, rows) }
     }
 }

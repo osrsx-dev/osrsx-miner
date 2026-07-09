@@ -2,7 +2,7 @@ package io.osrsx.plugins.skilling
 
 import io.osrsx.api.PluginContext
 import io.osrsx.api.Skill
-import io.osrsx.plugin.ScriptGui
+import io.osrsx.plugin.Gfx2D
 import java.util.concurrent.ThreadLocalRandom
 
 /**
@@ -103,7 +103,7 @@ class StopTargets(
  */
 object MinerOverlay {
 
-    fun render(gui: ScriptGui, stats: MinerStats, rows: List<Pair<String, String>> = emptyList()) {
+    fun render(gui: Gfx2D, stats: MinerStats, rows: List<Pair<String, String>> = emptyList()) {
         row(gui, "Status", stats.status)
         row(gui, "Level", stats.level().toString())
         row(gui, "XP", "${compact(stats.xpGained())} (${compact(stats.perHour(stats.xpGained()))}/hr)")
@@ -111,7 +111,7 @@ object MinerOverlay {
         row(gui, "Runtime", elapsed(stats.elapsedMs()))
     }
 
-    private fun row(gui: ScriptGui, label: String, value: String) {
+    private fun row(gui: Gfx2D, label: String, value: String) {
         gui.textColored(0.58f, 0.60f, 0.70f, 1f, "$label:")
         gui.sameLine()
         gui.textColored(0.92f, 0.94f, 0.98f, 1f, value)
