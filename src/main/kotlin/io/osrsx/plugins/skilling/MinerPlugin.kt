@@ -2,7 +2,6 @@ package io.osrsx.plugins.skilling
 
 import io.osrsx.api.profile
 import io.osrsx.plugin.HasOverlay
-import io.osrsx.plugin.PluginDescriptor
 import io.osrsx.plugin.RoutinePlugin
 import io.osrsx.plugin.routine
 import io.osrsx.plugin.ScriptGui
@@ -18,12 +17,6 @@ import io.osrsx.plugin.ScriptGui
  * pickaxe via the Loadout API ([Pickaxe]) and shows a live stats overlay. Every loop is profiled under
  * `miner/…` spans (zero-overhead when profiling is off).
  */
-@PluginDescriptor(
-    name = "Miner",
-    description = "Mines a chosen ore at a chosen location, with the right requirements per site.",
-    author = "osrsx",
-    tags = ["skilling", "mining", "gathering"],
-)
 class MinerPlugin : RoutinePlugin(), HasOverlay {
 
     override fun config() = Config

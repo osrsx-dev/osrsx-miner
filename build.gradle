@@ -2,6 +2,7 @@ apply plugin: 'io.osrsx.plugin'
 
 osrsxPlugin {
     id = 'miner'
+    main = 'io.osrsx.plugins.skilling.MinerPlugin'
     group = 'io.osrsx.plugins'
     version = '2.1.0'
     name = 'Miner'
