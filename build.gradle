@@ -4,7 +4,7 @@ osrsxPlugin {
     id = 'miner'
     main = 'io.osrsx.plugins.skilling.MinerPlugin'
     group = 'io.osrsx.plugins'
-    version = '2.1.0'
+    version = '2.1.1'
     name = 'Miner'
     description = 'Mines a chosen ore at a chosen location, with the right requirements per site.'
     authors = ['osrsx']
